@@ -27,7 +27,6 @@
 [Net.ServicePointManager]::SecurityProtocol='Tls12'; $f="$env:TEMP\vpn-install.ps1"; iwr -UseBasicParsing https://raw.githubusercontent.com/DoctorMot/svoy-vpn/main/install.ps1 -OutFile $f; powershell -NoProfile -ExecutionPolicy Bypass -File $f
 ```
 
-> Владельцу репозитория: замени `ИМЯ/РЕПОЗИТОРИЙ` в этой команде на свои.
 
 Параметры `install.ps1` (все необязательные): `-Server 203.0.113.10`, `-Port 2222` (если у хостера SSH не на 22), `-Reset` (выпустить новые ключи), `-Verify` (см. «Безопасность»).
 
