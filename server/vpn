@@ -240,6 +240,11 @@ proxy-groups:
     url: https://cp.cloudflare.com/generate_204
     interval: 300
     tolerance: 50
+  # Режим «Глобальный»: всё через сервер. Без этой группы mihomo выбирает
+  # в нём DIRECT, и в «Глобальном» трафик идёт мимо VPN.
+  - name: GLOBAL
+    type: select
+    proxies: [PROXY, AUTO, $names, DIRECT]
 
 rules:
   - IP-CIDR,127.0.0.0/8,DIRECT,no-resolve
