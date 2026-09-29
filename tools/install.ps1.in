@@ -82,6 +82,7 @@ function Test-Tcp([string]$HostName, [int]$TcpPort, [int]$TimeoutMs = 8000) {
 
 function Wrap76([string]$s) { (($s -split '(.{76})') | Where-Object { $_ }) -join "`n" }
 
+
 # ---------------------------------------------------------------------------
 if ($Verify) {
   $ok = $true
@@ -104,7 +105,8 @@ if ($Verify) {
 Write-Host ''
 Write-Host '  Свой VPN — установка на сервер' -ForegroundColor Cyan
 Dim "VLESS + REALITY (Xray), помощник vpn, firewall и fail2ban. Версия установщика $Version."
-Dim 'Займёт 2–5 минут. Повторный запуск безопасен: ключи и выданные доступы сохраняются.'
+Dim 'Обычно занимает 3–5 минут. На только что созданном сервере — до 20–30: сначала он сам ставит обновления системы.'
+Dim 'Повторный запуск безопасен: ключи и выданные доступы сохраняются.'
 Write-Host ''
 
 $ssh = Get-Command ssh -ErrorAction SilentlyContinue
@@ -188,6 +190,10 @@ for ($attempt = 1; $attempt -le 5 -and -not $done; $attempt++) {
   Write-Host ''
   Say "Подключаюсь к $target."
   Say 'Сейчас спросят пароль root из письма хостера. Символы при вводе не видны — это нормально.'
+  Dim 'Дальше сервер работает сам — окно не закрывай и Ctrl+C не нажимай. Если окно всё же закроется,'
+  Dim 'сервер доделает установку сам: просто запусти установщик снова, он дождётся и заберёт профиль.'
+  Dim 'Не щёлкай мышью внутри окна: в старой консоли Windows это ставит вывод на паузу (в заголовке'
+  Dim '«Выделить»). Если так вышло — нажми Esc.'
   Write-Host ''
   if ($env:VPN_TEST_RUNNER) {
     & $env:VPN_TEST_RUNNER $bundlePath $outPath        # только для автотестов

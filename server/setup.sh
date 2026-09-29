@@ -52,6 +52,51 @@ if command -v flock >/dev/null 2>&1; then
   fi
 fi
 
+# ---------- apt на новом сервере ----------
+# В первые 10–30 минут после создания сервер сам ставит обновления системы (cloud-init,
+# unattended-upgrades) и держит блокировку apt. Ждём, пока закончит, и показываем, что живы.
+apt_locked() {  # 0 — apt/dpkg сейчас занят другим процессом
+  if command -v python3 >/dev/null 2>&1; then
+    python3 - <<'PY_LOCK'
+import fcntl, os, sys
+for p in ("/var/lib/dpkg/lock-frontend", "/var/lib/dpkg/lock",
+          "/var/lib/apt/lists/lock", "/var/cache/apt/archives/lock"):
+    try:
+        fd = os.open(p, os.O_RDWR)
+    except OSError:
+        continue
+    try:
+        fcntl.lockf(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)   # тот же замок, что берут apt и dpkg
+    except OSError:
+        sys.exit(0)
+    finally:
+        os.close(fd)                                      # закрытие сразу отпускает замок
+sys.exit(1)
+PY_LOCK
+  else
+    pgrep -x dpkg >/dev/null 2>&1 || pgrep -x apt-get >/dev/null 2>&1 || pgrep -f '/unattended-upgrade( |$)' >/dev/null 2>&1
+  fi
+}
+cloud_init_running() {
+  command -v cloud-init >/dev/null 2>&1 && cloud-init status 2>/dev/null | grep -q 'status: running'
+}
+wait_apt() {
+  local t=0 said=""
+  while apt_locked || { [ "$t" -lt 900 ] && cloud_init_running; }; do
+    if [ -z "$said" ]; then
+      say "сервер сам ставит обновления системы — на только что созданном сервере это нормально,"
+      say "обычно 5–20 минут. Жду, пока закончит. Окно не закрывай."
+      said=1
+    fi
+    sleep 15; t=$((t + 15))
+    if [ $((t % 60)) -eq 0 ]; then say "…обновления системы ещё идут, жду уже $((t / 60)) мин"; fi
+    [ "$t" -lt 2700 ] || die "Обновления системы идут дольше 45 минут. Перезагрузи сервер в панели хостера (reboot) и запусти установку снова."
+  done
+  if [ -n "$said" ]; then ok "система закончила обновляться"; fi
+  # если прошлый запуск dpkg прервали (перезагрузка посреди обновлений) — доделываем его
+  dpkg --configure -a --force-confdef --force-confold >/dev/null 2>&1 || true
+}
+
 bad_dest(){ [[ "$1" =~ $BAD_DEST_RE ]]; }
 
 probe_dest() {  # TLS 1.3 + HTTP/2 + сертификат ECDSA
@@ -91,10 +136,11 @@ step 2/8 "Пакеты"
 if [ -n "$SKIP_APT" ]; then
   warn "пропускаю (SKIP_APT)"
 else
-  say "обновляю список пакетов (на новом сервере может занять пару минут)…"
-  # на свежем сервере apt часто занят автообновлением — ждём до 5 минут
+  wait_apt
+  say "обновляю список пакетов…"
   for i in $(seq 30); do
     if upd=$("${APT[@]}" update 2>&1); then break; fi
+    wait_apt
     # занят автообновлением — ждём; другая ошибка (например, сломанный сторонний репозиторий) —
     # после трёх попыток пробуем ставить со старыми списками
     if ! grep -qi 'lock' <<<"$upd" && [ "$i" -ge 3 ]; then
@@ -105,6 +151,8 @@ else
     [ "$i" = 30 ] && die "apt занят или недоступен уже 5 минут. Подожди и запусти установку снова."
     sleep 10
   done
+  wait_apt
+  say "ставлю пакеты (1–3 минуты)…"
   ilog=$(mktemp)
   if ! "${APT[@]}" -y install curl ca-certificates openssl python3 unzip qrencode logrotate \
       ufw fail2ban python3-systemd unattended-upgrades nftables >"$ilog" 2>&1; then
