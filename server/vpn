@@ -1,0 +1,531 @@
+#!/bin/bash
+# vpn — ключи для VLESS + REALITY на этом сервере (Xray). Часть проекта «Свой VPN».
+# Выпускает отдельный ключ на каждое устройство, показывает ссылку и QR,
+# собирает профиль для Clash Verge, отзывает ключи. Запуск: vpn help
+set -uo pipefail
+# Если SSH-сессия оборвётся (например, она сама шла через этот VPN и Xray
+# перезапускается), команда всё равно доработает до конца: проверка и откат не пропадут.
+trap '' HUP
+
+CFG="${VPN_CONFIG:-/usr/local/etc/xray/config.json}"
+OUT="${VPN_OUT:-/root/vpn-keys}"
+mkdir -p "$OUT"; chmod 700 "$OUT"
+
+red(){ printf '\033[31m%s\033[0m\n' "$*"; }
+grn(){ printf '\033[32m%s\033[0m\n' "$*"; }
+dim(){ printf '\033[2m%s\033[0m\n' "$*"; }
+die(){ red "Ошибка: $*"; exit 1; }
+
+[ -f "$CFG" ] || die "не найден $CFG — сервер ставили не скриптом из видео?"
+command -v python3 >/dev/null || die "нет python3"
+command -v xray >/dev/null || die "нет xray"
+
+# --- параметры сервера из config.json ---
+params() {
+python3 - "$CFG" <<'PY'
+import json, sys
+c = json.load(open(sys.argv[1]))
+v = [i for i in c.get("inbounds", []) if i.get("protocol") == "vless"]
+if not v: sys.exit("в конфиге нет vless-подключений")
+r = v[0]["streamSettings"]["realitySettings"]
+print(r["privateKey"]); print(r["serverNames"][0]); print(next((x for x in r["shortIds"] if x), ""))
+print(" ".join(str(i["port"]) for i in v))
+PY
+}
+
+server_ip() {
+  if [ -n "${VPN_IP:-}" ]; then echo "$VPN_IP"; return; fi
+  [ -s "$OUT/server_ip" ] && { cat "$OUT/server_ip"; return; }
+  local ip
+  ip=$(hostname -I 2>/dev/null | tr ' ' '\n' | grep -Ev '^(10\.|127\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.|169\.254\.|100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.)' | grep -E '^[0-9.]+$' | head -1)
+  [ -z "$ip" ] && ip=$(curl -4 -s --max-time 8 https://api.ipify.org || true)
+  [ -n "$ip" ] || die "не удалось определить IP сервера. Задайте вручную: echo 1.2.3.4 > $OUT/server_ip"
+  echo "$ip"
+}
+
+load() {
+  mapfile -t P < <(params) || die "не удалось прочитать $CFG"
+  PRIV="${P[0]}"; DEST="${P[1]}"; SID="${P[2]}"; PORTS="${P[3]}"
+  PUB=$(xray x25519 -i "$PRIV" 2>/dev/null | awk -F': *' '/^(Password|PublicKey|Public key)/{print $2; exit}')
+  [ -n "$PUB" ] || die "не удалось вычислить публичный ключ (xray x25519 -i)"
+  IP=$(server_ip)
+}
+
+uuid_of() {
+python3 - "$CFG" "$1" <<'PY'
+import json, sys
+c = json.load(open(sys.argv[1]))
+for i in c["inbounds"]:
+    if i.get("protocol") != "vless": continue
+    for u in i["settings"]["clients"]:
+        if u.get("email") == sys.argv[2]: print(u["id"]); sys.exit(0)
+sys.exit(1)
+PY
+}
+
+check_name() {
+  [[ "$1" =~ ^[a-zA-Z0-9_-]{1,32}$ ]] || die "имя «$1» не подходит: только латиница, цифры, - и _, до 32 символов. Пример: phone-anna"
+}
+
+link() {  # link UUID PORT NAME
+  echo "vless://$1@$IP:$2?encryption=none&flow=xtls-rprx-vision&security=reality&sni=$DEST&fp=chrome&pbk=$PUB&sid=$SID&type=tcp&headerType=none#$3-$2"
+}
+
+apply() {  # проверить конфиг и перезапустить; при сбое откатить
+  if ! xray run -test -config "$CFG" >/dev/null 2>&1; then
+    cp "$BAK" "$CFG"; die "новый конфиг не прошёл проверку — вернул прежний, ничего не сломано"
+  fi
+  systemctl restart xray; sleep 2
+  if ! systemctl is-active --quiet xray; then
+    cp "$BAK" "$CFG"; systemctl restart xray
+    die "Xray не запустился с новым конфигом — вернул прежний. Лог: journalctl -u xray -n 30"
+  fi
+}
+
+backup() { BAK="$OUT/config-$(date +%Y%m%d-%H%M%S).json"; cp "$CFG" "$BAK"; }
+
+show_qr() {  # show_qr TEXT NAME
+  if ! command -v qrencode >/dev/null; then
+    dim "ставлю qrencode для QR-кодов…"
+    apt-get install -y qrencode >/dev/null 2>&1 || { apt-get update -qq >/dev/null 2>&1; apt-get install -y qrencode >/dev/null 2>&1; } || true
+  fi
+  if command -v qrencode >/dev/null; then
+    qrencode -t ansiutf8 -m 2 "$1"
+    qrencode -t PNG -s 8 -o "$OUT/$2.png" "$1" && dim "картинка с QR: $OUT/$2.png"
+  else
+    dim "(qrencode не установился — QR не показан, используйте ссылку)"
+  fi
+}
+
+cmd_list() {
+python3 - "$CFG" <<'PY'
+import json, sys
+c = json.load(open(sys.argv[1])); seen = {}
+for i in c["inbounds"]:
+    if i.get("protocol") != "vless": continue
+    for u in i["settings"]["clients"]:
+        seen.setdefault(u.get("email") or "(без имени)", u["id"])
+print(f"Ключей: {len(seen)}")
+for k, v in seen.items(): print(f"  {k:<24} {v[:8]}…")
+PY
+}
+
+cmd_add() {
+  local name="${1:-}"; [ -n "$name" ] || die "укажите имя: vpn add phone"
+  check_name "$name"
+  uuid_of "$name" >/dev/null 2>&1 && die "ключ «$name» уже есть. Показать его: vpn link $name"
+  load; backup
+  local id; id=$(xray uuid)
+  python3 - "$CFG" "$id" "$name" <<'PY'
+import json, sys
+p, uid, name = sys.argv[1:4]
+c = json.load(open(p))
+for i in c["inbounds"]:
+    if i.get("protocol") == "vless":
+        i["settings"]["clients"].append({"id": uid, "flow": "xtls-rprx-vision", "email": name})
+json.dump(c, open(p, "w"), indent=2)
+PY
+  apply
+  grn "Готово: выпущен ключ «$name»."
+  echo; cmd_link "$name"
+}
+
+cmd_link() {
+  local name="${1:-}" want="${2:-}"; [ -n "$name" ] || die "укажите имя: vpn link phone"
+  local id; id=$(uuid_of "$name") || die "ключа «$name» нет. Список: vpn list"
+  [ -n "${IP:-}" ] || load
+  local first=1 p
+  for p in $PORTS; do
+    [ $first = 1 ] && echo "Основная ссылка (порт $p):" || echo "Запасная ссылка (порт $p):"
+    link "$id" "$p" "$name"; echo; first=0
+  done
+  set -- $PORTS
+  local qp="$1"
+  if [ -n "$want" ]; then
+    [[ " $PORTS " == *" $want "* ]] || die "порта $want нет. Есть: $PORTS"
+    qp="$want"
+  fi
+  if [ "$qp" = "$1" ]; then
+    echo "QR основной ссылки (порт $qp) — отсканируй приложением на телефоне:"
+  else
+    echo "QR запасной ссылки (порт $qp) — отсканируй приложением на телефоне:"
+  fi
+  show_qr "$(link "$id" "$qp" "$name")" "$name-$qp"
+  [ -z "$want" ] && [ $# -gt 1 ] && dim "QR запасной ссылки: vpn qr $name $2"
+  return 0
+}
+
+cmd_yaml() {
+  local name="${1:-}" mode="${2:-}"; [ -n "$name" ] || die "укажите имя: vpn yaml laptop"
+  local id; id=$(uuid_of "$name") || die "ключа «$name» нет. Сначала: vpn add $name"
+  load
+  local f="$OUT/$name.yaml" proxies="" names="" p
+  for p in $PORTS; do
+    proxies+="  - name: VLESS-$p
+    type: vless
+    server: $IP
+    port: $p
+    uuid: \"$id\"
+    network: tcp
+    tls: true
+    udp: true
+    flow: xtls-rprx-vision
+    servername: $DEST
+    client-fingerprint: chrome
+    reality-opts:
+      public-key: \"$PUB\"
+      short-id: \"$SID\"
+
+"
+    names+="VLESS-$p, "
+  done
+  names="${names%, }"
+  local ru=""
+  if [ "$mode" != "--all" ]; then
+    ru="  # Российские сайты — напрямую, мимо США (госуслуги, банки, маркетплейсы)
+  - DOMAIN-SUFFIX,ru,DIRECT
+  - DOMAIN-SUFFIX,su,DIRECT
+  - DOMAIN-SUFFIX,xn--p1ai,DIRECT
+  - DOMAIN-SUFFIX,xn--p1acf,DIRECT
+  - DOMAIN-SUFFIX,xn--80adxhks,DIRECT
+  - DOMAIN-SUFFIX,yandex.net,DIRECT
+  - DOMAIN-SUFFIX,yandex.com,DIRECT
+  - DOMAIN-SUFFIX,yastatic.net,DIRECT
+  - DOMAIN-SUFFIX,vk.com,DIRECT
+  - DOMAIN-SUFFIX,vk.me,DIRECT
+  - DOMAIN-SUFFIX,userapi.com,DIRECT
+  - DOMAIN-SUFFIX,vkuser.net,DIRECT
+  - DOMAIN-SUFFIX,mycdn.me,DIRECT
+  - DOMAIN-SUFFIX,avito.st,DIRECT
+"
+  fi
+  cat > "$f" <<EOF
+# Профиль Clash Verge — ключ «$name», сервер $IP
+# Создан $(date +%Y-%m-%d) командой: vpn yaml $name $mode
+mode: rule
+log-level: info
+ipv6: false
+unified-delay: true
+tcp-concurrent: true
+
+profile:
+  store-selected: true
+  store-fake-ip: true
+
+dns:
+  enable: true
+  listen: 127.0.0.1:1053
+  ipv6: false
+  enhanced-mode: fake-ip
+  fake-ip-range: 198.18.0.1/16
+  fake-ip-filter:
+    - '*.lan'
+    - '*.local'
+  default-nameserver: [1.1.1.1, 8.8.8.8]
+  nameserver:
+    - https://1.1.1.1/dns-query
+    - https://8.8.8.8/dns-query
+  proxy-server-nameserver:
+    - https://1.1.1.1/dns-query
+
+proxies:
+$proxies
+proxy-groups:
+  - name: PROXY
+    type: select
+    proxies: [AUTO, $names, DIRECT]
+  - name: AUTO
+    type: url-test
+    proxies: [$names]
+    url: https://cp.cloudflare.com/generate_204
+    interval: 300
+    tolerance: 50
+
+rules:
+  - IP-CIDR,127.0.0.0/8,DIRECT,no-resolve
+  - IP-CIDR,10.0.0.0/8,DIRECT,no-resolve
+  - IP-CIDR,172.16.0.0/12,DIRECT,no-resolve
+  - IP-CIDR,192.168.0.0/16,DIRECT,no-resolve
+  - IP-CIDR,100.64.0.0/10,DIRECT,no-resolve
+  - IP-CIDR,169.254.0.0/16,DIRECT,no-resolve
+  - DOMAIN-SUFFIX,lan,DIRECT
+  - DOMAIN-SUFFIX,local,DIRECT
+  - IP-CIDR,$IP/32,DIRECT,no-resolve
+$ru  - MATCH,PROXY
+EOF
+  chmod 600 "$f"
+  grn "Профиль готов: $f"
+  if [ "$mode" = "--all" ]; then dim "Режим: весь трафик через США."; else dim "Режим: российские сайты напрямую, остальное через США. Всё через США: vpn yaml $name --all"; fi
+  echo
+  echo "Скачать на компьютер — эту команду вводи в НОВОМ окне PowerShell на компьютере, не здесь:"
+  echo "  scp root@$IP:$f \"\$env:USERPROFILE\\Downloads\\$name.yaml\""
+  echo "Файл окажется в папке «Загрузки»."
+}
+
+cmd_del() {
+  local name="${1:-}"; [ -n "$name" ] || die "укажите имя: vpn del phone"
+  uuid_of "$name" >/dev/null 2>&1 || die "ключа «$name» нет. Список: vpn list"
+  local left
+  left=$(python3 - "$CFG" "$name" <<'PY'
+import json, sys
+c = json.load(open(sys.argv[1])); s = set()
+for i in c["inbounds"]:
+    if i.get("protocol") == "vless":
+        s.update(u.get("email") for u in i["settings"]["clients"] if u.get("email") != sys.argv[2])
+print(len(s))
+PY
+)
+  [ "$left" -ge 1 ] || die "это последний ключ — без него к серверу не подключится никто. Сначала выпустите другой: vpn add ИМЯ"
+  backup
+  python3 - "$CFG" "$name" <<'PY'
+import json, sys
+p, name = sys.argv[1:3]
+c = json.load(open(p))
+for i in c["inbounds"]:
+    if i.get("protocol") == "vless":
+        i["settings"]["clients"] = [u for u in i["settings"]["clients"] if u.get("email") != name]
+json.dump(c, open(p, "w"), indent=2)
+PY
+  apply
+  rm -f "$OUT/$name.png" "$OUT/$name.yaml"
+  for p in $(params | sed -n 4p); do rm -f "$OUT/$name-$p.png"; done
+  grn "Ключ «$name» отозван. Устройство с ним больше не подключится."
+}
+
+stale_check() {  # Xray запущен раньше, чем менялся конфиг? значит работает со старыми ключами
+  local pid et start mt
+  pid=$(systemctl show -p MainPID --value xray 2>/dev/null)
+  [[ "$pid" =~ ^[1-9][0-9]*$ ]] || pid=$(pgrep -o -x xray 2>/dev/null)
+  [ -n "$pid" ] || return 0
+  et=$(ps -o etimes= -p "$pid" 2>/dev/null | tr -d ' ')
+  [[ "$et" =~ ^[0-9]+$ ]] || return 0
+  start=$(( $(date +%s) - et )); mt=$(stat -c %Y "$CFG")
+  if [ "$mt" -gt $((start + 2)) ]; then
+    red "  Xray работает со СТАРЫМИ настройками: ключи менялись после его запуска."
+    red "  Новые ключи не заработают, пока не выполнишь: systemctl restart xray"
+  fi
+}
+
+cmd_log() {
+  local name="${1:-}"; [ -n "$name" ] || die "укажите имя: vpn log phone"
+  uuid_of "$name" >/dev/null 2>&1 || die "ключа «$name» нет. Список: vpn list"
+  local f n
+  f=$(python3 - "$CFG" <<'PY'
+import json, sys
+print(json.load(open(sys.argv[1])).get("log", {}).get("access", ""))
+PY
+)
+  { [ -n "$f" ] && [ -f "$f" ]; } || die "журнал подключений не найден (${f:-не задан в конфиге})"
+  # Xray пишет журнал в МЕСТНОМ времени сервера (у американских серверов это не UTC)
+  echo "Сейчас на сервере: $(date '+%Y-%m-%d %H:%M:%S %Z') — в журнале время в этом же поясе"
+  n=$(grep -cE "email: ${name}[[:space:]]*\$" "$f")
+  if [ "$n" -eq 0 ]; then
+    red "Подключений с ключом «$name» в журнале нет."
+    echo "Устройство либо не достучалось до сервера, либо ключ не подошёл."
+  else
+    grn "Подключений с ключом «$name»: $n. Последние:"
+    grep -E "email: ${name}[[:space:]]*\$" "$f" | tail -n 8
+    local last ts ago
+    last=$(grep -E "email: ${name}[[:space:]]*\$" "$f" | tail -n 1 | cut -c1-19 | tr / -)
+    if ts=$(date -d "$last" +%s 2>/dev/null); then
+      ago=$(( ($(date +%s) - ts) / 60 ))
+      if [ "$ago" -le 5 ]; then grn "Последнее подключение — только что ($ago мин назад)."
+      else echo "Последнее подключение — $ago мин назад. Свежих попыток не было."; fi
+    fi
+  fi
+}
+
+# --- сайт-прикрытие (dest / SNI) ---
+# Заблокированные или замедляемые в России: Speedtest заблокирован РКН 30.07.2025,
+# Cloudflare в России замедляют. Apple/iCloud сам Xray не советует: по ним IP блокируют чаще.
+# Имя сайта-прикрытия провайдер видит в открытом виде.
+BAD_DEST_RE='(^|\.)(speedtest\.net|ooklaserver\.net|cloudflare\.com|one\.one\.one\.one|apple\.com|icloud\.com)$'
+DEST_CANDIDATES="${VPN_DEST_CANDIDATES:-www.bing.com dl.google.com www.microsoft.com www.samsung.com www.asus.com www.amd.com www.dell.com www.nvidia.com www.logitech.com www.hp.com}"
+
+bad_dest() { [[ "$1" =~ $BAD_DEST_RE ]]; }
+
+probe_dest() {  # те же требования, что в скрипте из видео: TLS 1.3 + HTTP/2 + ECDSA
+  local d="$1" alg alpn
+  alg=$(timeout 12 openssl s_client -connect "$d:443" -servername "$d" -tls1_3 </dev/null 2>/dev/null \
+        | openssl x509 -noout -text 2>/dev/null | grep -m1 "Public Key Algorithm" | sed 's/.*: //')
+  alpn=$(timeout 12 openssl s_client -connect "$d:443" -servername "$d" -alpn h2 -tls1_3 </dev/null 2>/dev/null \
+        | grep -c "ALPN protocol: h2")
+  if [ -z "$alg" ]; then echo "нет TLS 1.3 или сайт недоступен"; return 1; fi
+  if [ "$alg" != "id-ecPublicKey" ]; then echo "сертификат не ECDSA ($alg)"; return 1; fi
+  if [ "$alpn" != "1" ]; then echo "нет HTTP/2"; return 1; fi
+  echo "подходит"; return 0
+}
+
+set_dest() {
+  local d="$1"
+  backup
+  python3 - "$CFG" "$d" <<'PY'
+import json, sys
+p, d = sys.argv[1:3]
+c = json.load(open(p))
+for i in c["inbounds"]:
+    if i.get("protocol") != "vless": continue
+    r = i["streamSettings"]["realitySettings"]
+    if "target" in r: r["target"] = f"{d}:443"
+    else: r["dest"] = f"{d}:443"
+    r["serverNames"] = [d]
+json.dump(c, open(p, "w"), indent=2)
+PY
+  apply
+  grn "Готово: сайт-прикрытие теперь $d."
+  echo
+  red "ВАЖНО: старые ссылки и профили больше не подключатся — в них прежнее имя сайта."
+  echo "Обнови все устройства (сами ключи те же, меняется только ссылка):"
+  python3 - "$CFG" <<'PY'
+import json, sys
+c = json.load(open(sys.argv[1])); seen = []
+for i in c["inbounds"]:
+    if i.get("protocol") != "vless": continue
+    for u in i["settings"]["clients"]:
+        e = u.get("email")
+        if e and e not in seen: seen.append(e)
+for e in seen:
+    print(f"  {e:<16} телефон/планшет: vpn link {e}   ·   компьютер: vpn yaml {e}")
+PY
+}
+
+cmd_dest() {
+  local arg="${1:-}" d r
+  load
+  if [ -z "$arg" ]; then
+    echo "Сейчас сайт-прикрытие: $DEST"
+    bad_dest "$DEST" && red "  Этот сайт заблокирован или замедляется в России — из-за него VPN может не подключаться."
+    echo "Проверяю кандидатов с сервера (до минуты)…"
+    for d in $DEST_CANDIDATES; do
+      r=$(probe_dest "$d") && grn "  $d — $r" || dim "  $d — $r"
+    done
+    echo "Сменить на первый подходящий: vpn dest auto     или на конкретный: vpn dest ИМЯ_САЙТА"
+    return 0
+  fi
+  if [ "$arg" = "auto" ]; then
+    echo "Ищу подходящий сайт-прикрытие…"
+    for d in $DEST_CANDIDATES; do
+      bad_dest "$d" && continue
+      [ "$d" = "$DEST" ] && continue
+      if r=$(probe_dest "$d"); then set_dest "$d"; return 0; fi
+      dim "  $d — $r"
+    done
+    die "ни один кандидат не подошёл. Укажи сайт вручную: vpn dest ИМЯ_САЙТА"
+  fi
+  d="${arg,,}"
+  [[ "$d" =~ ^[a-z0-9.-]+\.[a-z]{2,}$ ]] || die "«$arg» не похоже на имя сайта. Пример: vpn dest www.bing.com"
+  bad_dest "$d" && die "$d заблокирован или замедляется в России — выбери другой"
+  r=$(probe_dest "$d") || die "$d не подходит: $r"
+  set_dest "$d"
+}
+
+# --- DNS на стороне сервера ---
+# Телефонные приложения (Happ, v2rayNG) шлют DNS-запросы через туннель как UDP на 1.1.1.1:53.
+# «vpn dns on» заставляет Xray отвечать на них самому: через DNS самого сервера,
+# а если он не ответит — через DNS-over-HTTPS (TCP). Внешний UDP больше не нужен.
+cmd_dns() {
+  local mode="${1:-status}"
+  case "$mode" in
+    status|"")
+      python3 - "$CFG" <<'PY'
+import json, sys
+c = json.load(open(sys.argv[1]))
+on = any(o.get("tag") == "dns-out" for o in c.get("outbounds", []))
+print("DNS на сервере: " + ("ВКЛЮЧЁН (vpn dns off — выключить)" if on else "выключен (vpn dns on — включить)"))
+PY
+      echo "Проверка: может ли сервер сам спросить DNS по UDP у 1.1.1.1…"
+      if python3 - <<'PY'
+import socket, sys
+q = bytes.fromhex("123401000001000000000000") + b"\x06google\x03com\x00\x00\x01\x00\x01"
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.settimeout(5)
+try:
+    s.sendto(q, ("1.1.1.1", 53)); s.recv(512); sys.exit(0)
+except Exception:
+    sys.exit(1)
+PY
+      then grn "  ответ получен — UDP DNS с сервера работает"
+      else red "  ответа НЕТ — сервер не получает DNS-ответы по UDP. Включи: vpn dns on"; fi
+      ;;
+    on|off)
+      backup
+      python3 - "$CFG" "$mode" <<'PY'
+import json, sys
+p, mode = sys.argv[1:3]
+c = json.load(open(p))
+outs = c.setdefault("outbounds", [])
+rules = c.setdefault("routing", {}).setdefault("rules", [])
+outs[:] = [o for o in outs if o.get("tag") != "dns-out"]
+rules[:] = [r for r in rules if r.get("outboundTag") != "dns-out"]
+c.pop("dns", None)
+if mode == "on":
+    c["dns"] = {"servers": ["localhost", "https+local://1.1.1.1/dns-query"], "queryStrategy": "UseIPv4"}
+    outs.append({"protocol": "dns", "tag": "dns-out"})
+    rules.insert(0, {"type": "field", "port": "53", "outboundTag": "dns-out"})
+json.dump(c, open(p, "w"), indent=2)
+PY
+      apply
+      if [ "$mode" = on ]; then grn "Готово: сервер сам отвечает на DNS-запросы устройств. Ссылки и ключи менять не нужно."
+      else grn "Готово: DNS снова уходит напрямую, как было."; fi
+      ;;
+    *) die "используй: vpn dns, vpn dns on или vpn dns off" ;;
+  esac
+}
+
+cmd_status() {
+  load
+  if systemctl is-active --quiet xray; then grn "Xray работает"; stale_check; else red "Xray НЕ работает — см. journalctl -u xray -n 30"; fi
+  local ver; ver=$(xray version 2>/dev/null | awk 'NR==1{print $2}')
+  echo "Версия Xray:       ${ver:-?}"
+  if [ -n "$ver" ] && [ "$(printf '%s\n%s\n' "$ver" 26.3.27 | sort -V | tail -1)" != "26.3.27" ]; then
+    red "  Версия новее 26.3.27. Начиная с 26.9 Xray не пускает клиентов Clash Verge / FlClash (mihomo)."
+    red "  Вернуть проверенную версию: bash -c \"\$(curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh)\" @ install --version v26.3.27"
+  fi
+  echo "IP сервера:        $IP"
+  echo "Сайт-прикрытие:    $DEST"
+  if bad_dest "$DEST"; then
+    red "  ВНИМАНИЕ: $DEST заблокирован или замедляется в России — провайдер может рвать подключения."
+    red "  Смени сайт-прикрытие: vpn dest auto"
+  fi
+  echo "Порты:             $PORTS"
+  if command -v ss >/dev/null; then
+    for p in $PORTS; do
+      if ss -tln 2>/dev/null | grep -q ":$p "; then echo "  порт $p слушается"; else red "  порт $p НЕ слушается"; fi
+    done
+  fi
+  cmd_list
+}
+
+cmd_help() {
+cat <<'EOF'
+vpn — ключи для твоего VLESS-сервера
+
+  vpn status            всё ли работает, IP, порты, список ключей
+  vpn list              какие ключи выпущены
+  vpn add ИМЯ           выпустить ключ для нового устройства (покажет ссылку и QR)
+  vpn link ИМЯ          ещё раз показать ссылки и QR готового ключа
+  vpn qr ИМЯ 8443       QR запасной ссылки (порт 8443)
+  vpn yaml ИМЯ          профиль для Clash Verge (российские сайты напрямую)
+  vpn yaml ИМЯ --all    профиль для Clash Verge (весь трафик через США)
+  vpn del ИМЯ           отозвать ключ (например, потерян телефон)
+  vpn log ИМЯ           подключалось ли устройство с этим ключом (последние записи)
+  vpn dest              какой сайт-прикрытие сейчас и какие подходят
+  vpn dest auto         сменить сайт-прикрытие на подходящий (потом обнови ссылки на всех устройствах)
+  vpn dns               проверить DNS на сервере;  vpn dns on — сервер сам отвечает на DNS телефонов
+
+Имена — латиницей: phone, phone-mama, laptop, ipad…
+Ключ «clash» — это компьютер, который настроил скрипт из видео.
+EOF
+}
+
+case "${1:-help}" in
+  status) cmd_status ;;
+  list|ls) cmd_list ;;
+  add) cmd_add "${2:-}" ;;
+  link|show|qr) cmd_link "${2:-}" "${3:-}" ;;
+  yaml|clash) cmd_yaml "${2:-}" "${3:-}" ;;
+  del|rm|delete) cmd_del "${2:-}" ;;
+  log) cmd_log "${2:-}" ;;
+  dest) cmd_dest "${2:-}" ;;
+  dns) cmd_dns "${2:-}" ;;
+  *) cmd_help ;;
+esac

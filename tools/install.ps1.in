@@ -1,0 +1,288 @@
+<#
+  «Свой VPN» — установщик для Windows.
+
+  Ставит на твой сервер VLESS + REALITY (Xray), помощник vpn и защиту сервера,
+  а готовый профиль для Clash Verge кладёт на рабочий стол.
+
+  Запуск:  двойной щелчок по install.cmd
+     или:  powershell -NoProfile -ExecutionPolicy Bypass -File install.ps1
+
+  Параметры (все необязательные):
+    -Server 203.0.113.10   IP сервера (иначе спросит)
+    -Port 22               порт SSH, если хостер дал другой
+    -Reset                 выпустить новые ключи (старые перестанут работать)
+    -Verify                только сверить вшитые файлы с папкой server\ и выйти
+
+  Нужен только встроенный в Windows ssh. Node.js и сторонние пакеты не нужны.
+  Серверная часть (server\setup.sh и server\vpn) вшита в этот файл целиком,
+  проверить совпадение: install.ps1 -Verify
+#>
+param(
+  [string]$Server = '',
+  [int]$Port = 22,
+  [string]$User = 'root',
+  [switch]$Reset,
+  [switch]$Verify
+)
+
+$ErrorActionPreference = 'Stop'
+# любая непредвиденная ошибка — показать и не закрывать окно молча
+trap {
+  Write-Host ''
+  Write-Host "  [X] Непредвиденная ошибка: $($_.Exception.Message)" -ForegroundColor Red
+  try { if ($tmp) { Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue } } catch {}
+  Write-Host ''; [void](Read-Host '  Нажми Enter, чтобы закрыть окно')
+  exit 1
+}
+try { [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false) } catch {}
+try { $Host.UI.RawUI.WindowTitle = 'Свой VPN — установка' } catch {}
+
+# ---- вшитая серверная часть (генерируется tools/build.py из папки server\) ----
+$SetupB64 = '@SETUP_B64@'
+$VpnB64   = '@VPN_B64@'
+$SetupSha = '@SETUP_SHA@'
+$VpnSha   = '@VPN_SHA@'
+$Version  = '@VERSION@'
+
+function Say([string]$t)  { Write-Host "  $t" }
+function Dim([string]$t)  { Write-Host "  $t" -ForegroundColor DarkGray }
+function Good([string]$t) { Write-Host "  [OK] $t" -ForegroundColor Green }
+function Warn([string]$t) { Write-Host "  [!] $t" -ForegroundColor Yellow }
+function Bad([string]$t)  { Write-Host "  [X] $t" -ForegroundColor Red }
+function Pause-End { Write-Host ''; [void](Read-Host '  Нажми Enter, чтобы закрыть окно') }
+
+function Get-Sha256Hex([byte[]]$bytes) {
+  $h = [System.Security.Cryptography.SHA256]::Create()
+  try { return (($h.ComputeHash($bytes) | ForEach-Object { $_.ToString('x2') }) -join '') } finally { $h.Dispose() }
+}
+
+# Проверка TCP-порта с таймаутом: ok / timeout / refused / dns / error
+function Test-Tcp([string]$HostName, [int]$TcpPort, [int]$TimeoutMs = 8000) {
+  $c = New-Object System.Net.Sockets.TcpClient
+  try {
+    $ar = $c.BeginConnect($HostName, $TcpPort, $null, $null)
+    if (-not $ar.AsyncWaitHandle.WaitOne($TimeoutMs)) { return 'timeout' }
+    $c.EndConnect($ar)
+    return 'ok'
+  } catch {
+    $e = $_.Exception
+    while ($e.InnerException) { $e = $e.InnerException }
+    if ($e -is [System.Net.Sockets.SocketException]) {
+      switch ([string]$e.SocketErrorCode) {
+        'ConnectionRefused' { return 'refused' }
+        'HostNotFound'      { return 'dns' }
+        'NoData'            { return 'dns' }
+        'TryAgain'          { return 'dns' }
+        'TimedOut'          { return 'timeout' }
+      }
+    }
+    return 'error'
+  } finally { $c.Close() }
+}
+
+function Wrap76([string]$s) { (($s -split '(.{76})') | Where-Object { $_ }) -join "`n" }
+
+# ---------------------------------------------------------------------------
+if ($Verify) {
+  $ok = $true
+  foreach ($pair in @(@('server\setup.sh', $SetupB64, $SetupSha), @('server\vpn', $VpnB64, $VpnSha))) {
+    $emb = [Convert]::FromBase64String($pair[1])
+    $calc = Get-Sha256Hex $emb
+    $path = Join-Path $PSScriptRoot $pair[0]
+    if (-not (Test-Path $path)) { $path = Join-Path $PSScriptRoot ($pair[0] -replace '\\', '/') }
+    if ($calc -ne $pair[2]) { Bad "$($pair[0]): вшитая копия повреждена"; $ok = $false; continue }
+    if (Test-Path $path) {
+      $txt = [IO.File]::ReadAllText($path) -replace "`r`n", "`n"
+      $disk = Get-Sha256Hex ([Text.Encoding]::UTF8.GetBytes($txt))
+      if ($disk -eq $calc) { Good "$($pair[0]) совпадает с вшитой копией (SHA-256 $calc)" }
+      else { Bad "$($pair[0]) НЕ совпадает с вшитой копией"; $ok = $false }
+    } else { Warn "$($pair[0]) не найден рядом — сверил только целостность вшитой копии ($calc)" }
+  }
+  if ($ok) { exit 0 } else { exit 1 }
+}
+
+Write-Host ''
+Write-Host '  Свой VPN — установка на сервер' -ForegroundColor Cyan
+Dim "VLESS + REALITY (Xray), помощник vpn, firewall и fail2ban. Версия установщика $Version."
+Dim 'Займёт 2–5 минут. Повторный запуск безопасен: ключи и выданные доступы сохраняются.'
+Write-Host ''
+
+$ssh = Get-Command ssh -ErrorAction SilentlyContinue
+if (-not $ssh) {
+  Bad 'В Windows не найден ssh.'
+  Say 'Включи его: Параметры → Приложения → Дополнительные компоненты → Добавить → «Клиент OpenSSH».'
+  Say 'Или в PowerShell от имени администратора:'
+  Say '  Add-WindowsCapability -Online -Name OpenSSH.Client~~~~0.0.1.0'
+  Pause-End; exit 1
+}
+if ($User -ne 'root') { Warn "Установщик рассчитан на пользователя root, а указан $User. Если не сработает — запусти без -User." }
+
+if (Get-Process -Name 'verge-mihomo', 'verge-mihomo-alpha', 'clash-verge', 'mihomo' -ErrorAction SilentlyContinue) {
+  Warn 'Запущен Clash Verge. Закрой его на время установки: значок в трее → «Выход».'
+  Dim  'Иначе проверки будут неточными, а в режиме «Глобальный» связь с сервером оборвётся, когда он перезапустит VPN.'
+  Write-Host ''
+}
+
+# ---- 1. адрес сервера и его доступность ----
+while ($true) {
+  if (-not $Server) { $Server = (Read-Host '  IP сервера (из письма хостера)').Trim() }
+  if ($Server -notmatch '^[A-Za-z0-9.\-]+$' -or $Server -notmatch '[0-9A-Za-z]') {
+    Warn 'Нужен адрес вида 203.0.113.10'; $Server = ''; continue
+  }
+  Write-Host "  Проверяю, доступен ли $Server с твоего интернета… " -NoNewline
+  $r = Test-Tcp $Server $Port 8000
+  if ($r -eq 'ok') { Write-Host 'доступен' -ForegroundColor Green; break }
+  Write-Host ''
+  switch ($r) {
+    'dns'     { Warn "Адрес $Server не найден — похоже на опечатку." }
+    'refused' { Warn "Сервер отвечает, но порт $Port закрыт: он ещё запускается или SSH на другом порту (параметр -Port)." }
+    default   { Warn "До $Server не доходят пакеты. Чаще всего это блокировка IP у провайдера — попроси хостера сменить IP."
+                Dim  'Если сервер только что создан, подожди 5 минут и попробуй снова.' }
+  }
+  $a = (Read-Host '  Enter — попробовать снова или ввести другой адрес, «в» — выйти').Trim()
+  if ($a -match '^[вВqQ]') { Pause-End; exit 1 }
+  $Server = ''
+}
+
+# ---- 2. пакет для сервера: файлы + запуск установки ----
+$resetVal = ''; if ($Reset) { $resetVal = '1' }
+$noColor = '1'; if ($env:WT_SESSION) { $noColor = '' }   # цвета только в Windows Terminal
+$bundle = (@(
+  'set -e',
+  'umask 077',
+  # у каждого запуска своя папка: повтор не трогает файлы установки, которая ещё идёт
+  'D=/root/.vpn-setup/run-$(date +%Y%m%d-%H%M%S)-$$',
+  'mkdir -p "$D"',
+  "base64 -d > `"`$D/setup.sh`" <<'B64EOF'",
+  (Wrap76 $SetupB64),
+  'B64EOF',
+  "base64 -d > `"`$D/vpn`" <<'B64EOF'",
+  (Wrap76 $VpnB64),
+  'B64EOF',
+  "echo `"$SetupSha  `$D/setup.sh`" | sha256sum -c --quiet >&2",
+  "echo `"$VpnSha  `$D/vpn`" | sha256sum -c --quiet >&2",
+  'install -m 755 "$D/vpn" /usr/local/bin/vpn',
+  'ls -1dt /root/.vpn-setup/run-* 2>/dev/null | tail -n +6 | xargs -r rm -rf',
+  'cd "$D" && : > log.txt',
+  # установка идёт отдельно от SSH-сессии: если связь оборвётся, сервер доведёт её до конца сам
+  "setsid env RESET='$resetVal' NO_COLOR='$noColor' bash setup.sh < /dev/null > out.txt 2> log.txt &",
+  'pid=$!',
+  'tail -n +1 --pid=$pid -f log.txt >&2 || true',
+  'rc=0; wait $pid || rc=$?',
+  'cat out.txt; rm -f out.txt',
+  'exit $rc'
+) -join "`n") + "`n"
+
+$tmp = Join-Path ([IO.Path]::GetTempPath()) ('vpn-setup-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+New-Item -ItemType Directory -Path $tmp | Out-Null
+$bundlePath = Join-Path $tmp 'bundle.sh'
+$outPath    = Join-Path $tmp 'out.txt'
+[IO.File]::WriteAllText($bundlePath, $bundle, (New-Object System.Text.UTF8Encoding($false)))
+function Cleanup { try { Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue } catch {} }
+
+# ---- 3. установка по SSH (один вход — один пароль) ----
+$target  = "$User@$Server"
+$sshOpts = "-p $Port -o StrictHostKeyChecking=accept-new -o LogLevel=ERROR -o ConnectTimeout=20 -o ServerAliveInterval=15 -o ServerAliveCountMax=8"
+$done = $false
+for ($attempt = 1; $attempt -le 5 -and -not $done; $attempt++) {
+  Write-Host ''
+  Say "Подключаюсь к $target."
+  Say 'Сейчас спросят пароль root из письма хостера. Символы при вводе не видны — это нормально.'
+  Write-Host ''
+  if ($env:VPN_TEST_RUNNER) {
+    & $env:VPN_TEST_RUNNER $bundlePath $outPath        # только для автотестов
+  } else {
+    cmd.exe /d /c "ssh $sshOpts $target bash -s < `"$bundlePath`" > `"$outPath`""
+  }
+  $code = $LASTEXITCODE
+  if ($code -eq 0) { $done = $true; break }
+  Write-Host ''
+  if ($code -ne 255) {
+    Bad "Установка на сервере не завершилась (код $code). Причина — в последних строках выше."
+    Dim 'Повторный запуск установщика безопасен: ключи и настройки сохраняются.'
+    Cleanup; Pause-End; exit 1
+  }
+  Bad 'Не удалось войти на сервер по SSH. Посмотри сообщение выше:'
+  Say '  «Permission denied» — неверный пароль (проверь раскладку EN и Caps Lock);'
+  Say '  «REMOTE HOST IDENTIFICATION HAS CHANGED» — сервер переустанавливали;'
+  Say '  «timed out» / «refused» — сервер недоступен или ещё запускается;'
+  Say '  «Connection closed / reset» посреди установки — оборвалась связь. Сервер закончит установку сам,'
+  Say '     а повтор дождётся её и заберёт профиль (часто виноват включённый VPN — закрой Clash Verge).'
+  $a = (Read-Host '  Enter — повторить, «з» — забыть старый отпечаток сервера и повторить, «в» — выйти').Trim()
+  if ($a -match '^[вВqQ]') { Cleanup; Pause-End; exit 1 }
+  if ($a -match '^[зЗzZ]') {
+    $known = $Server; if ($Port -ne 22) { $known = "[$Server]:$Port" }
+    & ssh-keygen -R $known | Out-Null
+    Good 'Старый отпечаток удалён.'
+  }
+}
+if (-not $done) { Bad 'Не получилось подключиться.'; Cleanup; Pause-End; exit 1 }
+
+# ---- 4. забираем профиль ----
+$raw = [IO.File]::ReadAllText($outPath)
+$info = @{}
+$m = [regex]::Match($raw, '===VPN-INFO (?<v>[^\r\n]*?)===')
+if ($m.Success) {
+  foreach ($p in ($m.Groups['v'].Value -split ' ')) {
+    $i = $p.IndexOf('='); if ($i -gt 0) { $info[$p.Substring(0, $i)] = $p.Substring($i + 1) }
+  }
+}
+$files = [regex]::Matches($raw, '(?s)===VPN-FILE (?<n>[\w.\-]+)===\s*(?<b>[A-Za-z0-9+/=\s]+?)\s*===VPN-END===')
+if ($files.Count -eq 0) {
+  Bad "Сервер не вернул профиль. Зайди на сервер (ssh root@$Server) и выполни: vpn status"
+  Cleanup; Pause-End; exit 1
+}
+$desk = [Environment]::GetFolderPath('Desktop')
+if (-not $desk -or -not (Test-Path $desk)) { $desk = Join-Path $HOME 'Desktop' }
+if (-not (Test-Path $desk)) { $desk = $HOME }
+$saved = @()
+foreach ($f in $files) {
+  $bytes = [Convert]::FromBase64String(($f.Groups['b'].Value -replace '\s', ''))
+  $dst = Join-Path $desk $f.Groups['n'].Value
+  if (Test-Path $dst) { Copy-Item $dst "$dst.old" -Force }
+  [IO.File]::WriteAllBytes($dst, $bytes)
+  $saved += $dst
+}
+Cleanup   # во временной папке лежал профиль с ключом
+
+# ---- 5. проверка с этого компьютера ----
+Write-Host ''
+$ports = @('443'); if ($info['ports']) { $ports = $info['ports'] -split ',' }
+$blocked = @()
+foreach ($p in $ports) {
+  Write-Host "  Проверяю порт $p с твоего интернета… " -NoNewline
+  if ((Test-Tcp $Server ([int]$p) 8000) -eq 'ok') { Write-Host 'доступен' -ForegroundColor Green }
+  else { Write-Host 'НЕ доступен' -ForegroundColor Yellow; $blocked += $p }
+}
+if ($blocked.Count -gt 0) {
+  Warn 'Сервер работает, но часть портов недоступна из твоей сети. Если так и останется —'
+  Warn 'IP сервера, скорее всего, блокирует провайдер: попроси хостера сменить IP и запусти установщик снова.'
+}
+
+Write-Host ''
+Good 'Готово.'
+foreach ($s in $saved) { Good "Профиль для компьютера: $s" }
+if ($info['mode'] -eq 'upgrade') {
+  if ($info['dest_changed'] -eq '1') {
+    Warn "Сайт-прикрытие сменился на $($info['dest']): старые ссылки и профили на телефонах больше не подключатся."
+    Warn 'Обнови их на сервере: vpn link ИМЯ (QR) или vpn yaml ИМЯ (FlClash). Список ключей: vpn list.'
+  } else {
+    Dim 'Это был повторный запуск: ключи сохранены, выданные устройствам доступы работают.'
+  }
+}
+Write-Host ''
+Say 'Дальше:'
+Say '  1. Clash Verge → «Профили» → перетащи этот файл в окно и нажми на него, чтобы он стал активным.'
+Say '  2. «Настройки»: «Режим TUN» — ВКЛ, «Системный прокси» — ВЫКЛ. На вкладке «Прокси» режим «Правила».'
+Say '  3. Открой ipleak.net — там должен быть IP сервера.'
+Write-Host ''
+Say 'Телефон или ещё один компьютер — зайди на сервер и выпусти отдельный ключ:'
+Say "  ssh root@$Server"
+Say '  vpn add phone      (ссылка и QR для Happ / v2rayNG / INCY)'
+Say '  vpn yaml phone     (профиль для FlClash на Android — работает надёжнее)'
+Say 'Все команды: vpn help.'
+Say 'Не забудь сменить пароль root на сервере: команда passwd.'
+if (-not $env:VPN_TEST_RUNNER -and $saved.Count -gt 0) {
+  try { Start-Process explorer.exe -ArgumentList "/select,`"$($saved[0])`"" } catch {}
+}
+Pause-End
