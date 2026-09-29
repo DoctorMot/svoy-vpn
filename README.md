@@ -24,7 +24,7 @@
 **Одной командой** (в PowerShell, без скачивания архива):
 
 ```powershell
-[Net.ServicePointManager]::SecurityProtocol='Tls12'; $f="$env:TEMP\vpn-install.ps1"; iwr -UseBasicParsing https://raw.githubusercontent.com/ИМЯ/РЕПОЗИТОРИЙ/main/install.ps1 -OutFile $f; powershell -NoProfile -ExecutionPolicy Bypass -File $f
+[Net.ServicePointManager]::SecurityProtocol='Tls12'; $f="$env:TEMP\vpn-install.ps1"; iwr -UseBasicParsing https://raw.githubusercontent.com/DoctorMot/svoy-vpn/main/install.ps1 -OutFile $f; powershell -NoProfile -ExecutionPolicy Bypass -File $f
 ```
 
 > Владельцу репозитория: замени `ИМЯ/РЕПОЗИТОРИЙ` в этой команде на свои.
