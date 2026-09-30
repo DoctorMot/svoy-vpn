@@ -3,24 +3,35 @@
 
   Ставит на твой сервер VLESS + REALITY (Xray), помощник vpn и защиту сервера,
   а готовый профиль для Clash Verge кладёт на рабочий стол.
+  Второй режим — мост через российский сервер: он только пересылает зашифрованный
+  трафик на зарубежный сервер, ключей у него нет, прочитать трафик он не может.
 
   Запуск:  двойной щелчок по install.cmd
      или:  powershell -NoProfile -ExecutionPolicy Bypass -File install.ps1
 
   Параметры (все необязательные):
-    -Server 203.0.113.10   IP сервера (иначе спросит)
-    -Port 22               порт SSH, если хостер дал другой
+    -Server 203.0.113.10   IP зарубежного сервера (иначе спросит)
+    -Port 22               порт SSH сервера, если хостер дал другой
+    -Bridge 198.51.100.7   IP российского сервера — режим «мост»
+    -BridgeSshPort 22      порт SSH моста
+    -BridgePorts 443       порт моста; «443:8443» — порт моста:порт сервера
     -Reset                 выпустить новые ключи (старые перестанут работать)
     -Verify                только сверить вшитые файлы с папкой server\ и выйти
 
+  Обновить сервер или мост до новой версии — просто запусти новый установщик
+  с тем же адресом: ключи и выданные устройствам доступы сохраняются.
+
   Нужен только встроенный в Windows ssh. Node.js и сторонние пакеты не нужны.
-  Серверная часть (server\setup.sh и server\vpn) вшита в этот файл целиком,
-  проверить совпадение: install.ps1 -Verify
+  Серверная часть (server\setup.sh, server\vpn, server\bridge.sh) вшита в этот файл
+  целиком, проверить совпадение: install.ps1 -Verify
 #>
 param(
   [string]$Server = '',
   [int]$Port = 22,
   [string]$User = 'root',
+  [string]$Bridge = '',
+  [int]$BridgeSshPort = 22,
+  [string]$BridgePorts = '443',
   [switch]$Reset,
   [switch]$Verify
 )
@@ -38,11 +49,13 @@ try { [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false) } 
 try { $Host.UI.RawUI.WindowTitle = 'Свой VPN — установка' } catch {}
 
 # ---- вшитая серверная часть (генерируется tools/build.py из папки server\) ----
-$SetupB64 = '@SETUP_B64@'
-$VpnB64   = '@VPN_B64@'
-$SetupSha = '@SETUP_SHA@'
-$VpnSha   = '@VPN_SHA@'
-$Version  = '@VERSION@'
+$SetupB64  = '@SETUP_B64@'
+$VpnB64    = '@VPN_B64@'
+$BridgeB64 = '@BRIDGE_B64@'
+$SetupSha  = '@SETUP_SHA@'
+$VpnSha    = '@VPN_SHA@'
+$BridgeSha = '@BRIDGE_SHA@'
+$Version   = '@VERSION@'
 
 function Say([string]$t)  { Write-Host "  $t" }
 function Dim([string]$t)  { Write-Host "  $t" -ForegroundColor DarkGray }
@@ -82,11 +95,157 @@ function Test-Tcp([string]$HostName, [int]$TcpPort, [int]$TimeoutMs = 8000) {
 
 function Wrap76([string]$s) { (($s -split '(.{76})') | Where-Object { $_ }) -join "`n" }
 
+function Test-Ipv4([string]$s) {
+  if ($s -notmatch '^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$') { return $false }
+  foreach ($i in 1..4) { if ([int]$Matches[$i] -gt 255) { return $false } }
+  return $true
+}
+
+function Get-DesktopDir {
+  $d = [Environment]::GetFolderPath('Desktop')
+  if (-not $d -or -not (Test-Path $d)) { $d = Join-Path $HOME 'Desktop' }
+  if (-not (Test-Path $d)) { $d = $HOME }
+  return $d
+}
+
+# IP сервера из профиля, который прошлый запуск положил на рабочий стол — чтобы при обновлении не искать письмо хостера
+function Get-ProfileServer {
+  try {
+    $f = Join-Path (Get-DesktopDir) 'vpn-clash.yaml'
+    if (Test-Path $f) {
+      $m = [regex]::Match([IO.File]::ReadAllText($f), '(?m)^\s*server:\s*([0-9.]+)\s*$')
+      if ($m.Success -and (Test-Ipv4 $m.Groups[1].Value)) { return $m.Groups[1].Value }
+    }
+  } catch {}
+  return ''
+}
+
+function Read-Address([string]$Prompt, [string]$Default) {
+  $p = $Prompt
+  if ($Default) { $p = "$Prompt [Enter — $Default, из профиля на рабочем столе]" }
+  $v = (Read-Host "  $p").Trim()
+  if (-not $v -and $Default) { $v = $Default }
+  return $v
+}
+
+# Доступен ли SSH-порт. $true — да; $false — ввести адрес заново. «в» — выход.
+function Test-Reachable([string]$HostName, [int]$SshPort, [string]$What) {
+  Write-Host "  Проверяю, доступен ли $What $HostName с твоего интернета… " -NoNewline
+  $r = Test-Tcp $HostName $SshPort 8000
+  if ($r -eq 'ok') { Write-Host 'доступен' -ForegroundColor Green; return $true }
+  Write-Host ''
+  switch ($r) {
+    'dns'     { Warn "Адрес $HostName не найден — похоже на опечатку." }
+    'refused' { Warn "Сервер отвечает, но порт $SshPort закрыт: он ещё запускается или SSH на другом порту (параметр -Port)." }
+    default   { Warn "До $HostName не доходят пакеты. Чаще всего это блокировка IP у провайдера — попроси хостера сменить IP."
+                Dim  'Если сервер только что создан, подожди 5 минут и попробуй снова.' }
+  }
+  $a = (Read-Host '  Enter — попробовать снова или ввести другой адрес, «в» — выйти').Trim()
+  if ($a -match '^[вВqQ]') { Pause-End; exit 1 }
+  return $false
+}
+
+# Пакет для сервера: файлы + запуск установки. У каждого запуска своя папка: повтор не трогает
+# файлы установки, которая ещё идёт. Установка идёт отдельно от SSH-сессии: если связь оборвётся,
+# сервер доведёт её до конца сам.
+function New-Bundle([string]$Name, [string]$B64, [string]$Sha, [string]$EnvVars, [bool]$WithVpn) {
+  $l = @(
+    'set -e',
+    'umask 077',
+    'D=/root/.vpn-setup/run-$(date +%Y%m%d-%H%M%S)-$$',
+    'mkdir -p "$D"',
+    "base64 -d > `"`$D/$Name`" <<'B64EOF'",
+    (Wrap76 $B64),
+    'B64EOF'
+  )
+  if ($WithVpn) { $l += @("base64 -d > `"`$D/vpn`" <<'B64EOF'", (Wrap76 $VpnB64), 'B64EOF') }
+  $l += "echo `"$Sha  `$D/$Name`" | sha256sum -c --quiet >&2"
+  if ($WithVpn) {
+    $l += "echo `"$VpnSha  `$D/vpn`" | sha256sum -c --quiet >&2"
+    # какая версия стояла до обновления: помощник с 1.1.0 знает свою версию, более старые — нет
+    $l += 'if [ -x /usr/local/bin/vpn ]; then v=$(sed -n "s/^VPN_VERSION=//p" /usr/local/bin/vpn | head -1); echo "===VPN-PREV version=${v:-1.0.x}==="; fi'
+    $l += 'install -m 755 "$D/vpn" /usr/local/bin/vpn'
+  }
+  $l += @(
+    'ls -1dt /root/.vpn-setup/run-* 2>/dev/null | tail -n +6 | xargs -r rm -rf',
+    'cd "$D" && : > log.txt',
+    "setsid env $EnvVars bash $Name < /dev/null > out.txt 2> log.txt &",
+    'pid=$!',
+    'tail -n +1 --pid=$pid -f log.txt >&2 || true',
+    'rc=0; wait $pid || rc=$?',
+    'cat out.txt; rm -f out.txt',
+    'exit $rc'
+  )
+  return ($l -join "`n") + "`n"
+}
+
+function Read-Info([string]$Raw) {
+  $info = @{}
+  $m = [regex]::Match($Raw, '===VPN-INFO (?<v>[^\r\n]*?)===')
+  if ($m.Success) {
+    foreach ($p in ($m.Groups['v'].Value -split ' ')) {
+      $i = $p.IndexOf('='); if ($i -gt 0) { $info[$p.Substring(0, $i)] = $p.Substring($i + 1) }
+    }
+  }
+  $m = [regex]::Match($Raw, '===VPN-PREV version=(?<v>[^\s=]*)===')
+  if ($m.Success) { $info['prev_version'] = $m.Groups['v'].Value }
+  return $info
+}
+
+# Запуск пакета по SSH (один вход — один пароль; через мост — два). При ошибке установки выходит сам.
+function Invoke-Remote([string]$HostName, [int]$SshPort, [string]$Jump, [string]$BundlePath, [string]$OutPath, [string]$Where) {
+  $target  = "$User@$HostName"
+  $sshOpts = "-p $SshPort -o StrictHostKeyChecking=accept-new -o LogLevel=ERROR -o ConnectTimeout=20 -o ServerAliveInterval=15 -o ServerAliveCountMax=8"
+  if ($Jump) { $sshOpts += " -J $Jump" }
+  for ($attempt = 1; $attempt -le 5; $attempt++) {
+    Write-Host ''
+    if ($Jump) {
+      Say "Подключаюсь к $target через мост."
+      Say 'Сейчас спросят два пароля root: сначала МОСТА, потом ЗАРУБЕЖНОГО СЕРВЕРА. Символы при вводе не видны — это нормально.'
+    } else {
+      Say "Подключаюсь к $target."
+      Say 'Сейчас спросят пароль root из письма хостера. Символы при вводе не видны — это нормально.'
+    }
+    Dim 'Дальше сервер работает сам — окно не закрывай и Ctrl+C не нажимай. Если окно всё же закроется,'
+    Dim 'сервер доделает установку сам: просто запусти установщик снова, он дождётся и заберёт результат.'
+    Dim 'Не щёлкай мышью внутри окна: в старой консоли Windows это ставит вывод на паузу (в заголовке'
+    Dim '«Выделить»). Если так вышло — нажми Esc.'
+    Write-Host ''
+    if ($env:VPN_TEST_RUNNER) {
+      & $env:VPN_TEST_RUNNER $BundlePath $OutPath "$sshOpts $target"   # только для автотестов
+    } else {
+      cmd.exe /d /c "ssh $sshOpts $target bash -s < `"$BundlePath`" > `"$OutPath`""
+    }
+    $code = $LASTEXITCODE
+    if ($code -eq 0) { return }
+    Write-Host ''
+    if ($code -ne 255) {
+      Bad "Установка $Where не завершилась (код $code). Причина — в последних строках выше."
+      Dim 'Повторный запуск установщика безопасен: ключи и настройки сохраняются.'
+      Cleanup; Pause-End; exit 1
+    }
+    Bad 'Не удалось войти по SSH. Посмотри сообщение выше:'
+    Say '  «Permission denied» — неверный пароль (проверь раскладку EN и Caps Lock);'
+    Say '  «REMOTE HOST IDENTIFICATION HAS CHANGED» — сервер переустанавливали;'
+    Say '  «timed out» / «refused» — сервер недоступен или ещё запускается;'
+    Say '  «Connection closed / reset» посреди установки — оборвалась связь. Сервер закончит установку сам,'
+    Say '     а повтор дождётся её и заберёт результат (часто виноват включённый VPN — закрой Clash Verge).'
+    $a = (Read-Host '  Enter — повторить, «з» — забыть старый отпечаток сервера и повторить, «в» — выйти').Trim()
+    if ($a -match '^[вВqQ]') { Cleanup; Pause-End; exit 1 }
+    if ($a -match '^[зЗzZ]') {
+      $known = $HostName; if ($SshPort -ne 22) { $known = "[$HostName]:$SshPort" }
+      & ssh-keygen -R $known | Out-Null
+      Good 'Старый отпечаток удалён.'
+    }
+  }
+  Bad 'Не получилось подключиться.'; Cleanup; Pause-End; exit 1
+}
 
 # ---------------------------------------------------------------------------
 if ($Verify) {
   $ok = $true
-  foreach ($pair in @(@('server\setup.sh', $SetupB64, $SetupSha), @('server\vpn', $VpnB64, $VpnSha))) {
+  foreach ($pair in @(@('server\setup.sh', $SetupB64, $SetupSha), @('server\vpn', $VpnB64, $VpnSha),
+                      @('server\bridge.sh', $BridgeB64, $BridgeSha))) {
     $emb = [Convert]::FromBase64String($pair[1])
     $calc = Get-Sha256Hex $emb
     $path = Join-Path $PSScriptRoot $pair[0]
@@ -106,7 +265,7 @@ Write-Host ''
 Write-Host '  Свой VPN — установка на сервер' -ForegroundColor Cyan
 Dim "VLESS + REALITY (Xray), помощник vpn, firewall и fail2ban. Версия установщика $Version."
 Dim 'Обычно занимает 3–5 минут. На только что созданном сервере — до 20–30: сначала он сам ставит обновления системы.'
-Dim 'Повторный запуск безопасен: ключи и выданные доступы сохраняются.'
+Dim 'Повторный запуск безопасен: ключи и выданные доступы сохраняются. Так же сервер обновляется до новой версии.'
 Write-Host ''
 
 $ssh = Get-Command ssh -ErrorAction SilentlyContinue
@@ -125,122 +284,106 @@ if (Get-Process -Name 'verge-mihomo', 'verge-mihomo-alpha', 'clash-verge', 'miho
   Write-Host ''
 }
 
-# ---- 1. адрес сервера и его доступность ----
-while ($true) {
-  if (-not $Server) { $Server = (Read-Host '  IP сервера (из письма хостера)').Trim() }
-  if ($Server -notmatch '^[A-Za-z0-9.\-]+$' -or $Server -notmatch '[0-9A-Za-z]') {
-    Warn 'Нужен адрес вида 203.0.113.10'; $Server = ''; continue
-  }
-  Write-Host "  Проверяю, доступен ли $Server с твоего интернета… " -NoNewline
-  $r = Test-Tcp $Server $Port 8000
-  if ($r -eq 'ok') { Write-Host 'доступен' -ForegroundColor Green; break }
+# ---- 0. что настраиваем ----
+$Mode = 'server'
+if ($Bridge) { $Mode = 'bridge' }
+elseif (-not $Server) {
+  Say 'Что настраиваем?'
+  Say '  1 — сервер за рубежом: установить, обновить до новой версии или починить'
+  Say '  2 — мост через российский сервер (зарубежный сервер при этом тоже обновится)'
+  $a = (Read-Host '  1 или 2 [Enter — 1]').Trim()
+  if ($a -eq '2') { $Mode = 'bridge' }
   Write-Host ''
-  switch ($r) {
-    'dns'     { Warn "Адрес $Server не найден — похоже на опечатку." }
-    'refused' { Warn "Сервер отвечает, но порт $Port закрыт: он ещё запускается или SSH на другом порту (параметр -Port)." }
-    default   { Warn "До $Server не доходят пакеты. Чаще всего это блокировка IP у провайдера — попроси хостера сменить IP."
-                Dim  'Если сервер только что создан, подожди 5 минут и попробуй снова.' }
+}
+$ProfileIp = Get-ProfileServer
+$Jump = ''
+$bPorts = ''
+
+if ($Mode -eq 'server') {
+  # ---- 1. адрес сервера и его доступность ----
+  while ($true) {
+    if (-not $Server) { $Server = Read-Address 'IP сервера (из письма хостера)' $ProfileIp }
+    if ($Server -notmatch '^[A-Za-z0-9.\-]+$' -or $Server -notmatch '[0-9A-Za-z]') {
+      Warn 'Нужен адрес вида 203.0.113.10'; $Server = ''; continue
+    }
+    if (Test-Reachable $Server $Port 'сервер') { break }
+    $Server = ''
   }
-  $a = (Read-Host '  Enter — попробовать снова или ввести другой адрес, «в» — выйти').Trim()
-  if ($a -match '^[вВqQ]') { Pause-End; exit 1 }
-  $Server = ''
+} else {
+  Write-Host '  Режим: мост через российский сервер' -ForegroundColor Cyan
+  Dim 'Мост только пересылает зашифрованный трафик на зарубежный сервер: ключей и VPN-программ на нём нет,'
+  Dim 'прочитать трафик он не может. Понадобятся пароли root обоих серверов.'
+  Write-Host ''
+  # ---- 1. мост ----
+  while ($true) {
+    if (-not $Bridge) { $Bridge = Read-Address 'IP российского сервера (моста)' '' }
+    if (-not (Test-Ipv4 $Bridge)) { Warn 'Нужен IP вида 198.51.100.7'; $Bridge = ''; continue }
+    if (Test-Reachable $Bridge $BridgeSshPort 'мост') { break }
+    $Bridge = ''
+  }
+  # ---- 2. зарубежный сервер ----
+  while ($true) {
+    if (-not $Server) { $Server = Read-Address 'IP зарубежного сервера' $ProfileIp }
+    if (-not (Test-Ipv4 $Server)) { Warn 'Нужен IP вида 203.0.113.10'; $Server = ''; continue }
+    if ($Server -eq $Bridge) { Warn 'Это адрес моста, а нужен адрес зарубежного сервера.'; $Server = ''; continue }
+    break
+  }
+  $bp = @($BridgePorts -split '[ ,;]+' | Where-Object { $_ })
+  foreach ($p in $bp) {
+    if ($p -notmatch '^\d{1,5}(:\d{1,5})?$') { Bad "-BridgePorts: «$p» — нужен порт (443) или пара портов (443:8443)."; Pause-End; exit 1 }
+  }
+  $bPorts = $bp -join ' '
+  Write-Host "  Проверяю, доступен ли сервер $Server напрямую… " -NoNewline
+  if ((Test-Tcp $Server $Port 8000) -eq 'ok') {
+    Write-Host 'доступен' -ForegroundColor Green
+  } else {
+    Write-Host 'нет' -ForegroundColor Yellow
+    Dim 'Похоже, провайдер не пускает к нему напрямую — для этого мост и нужен. Зайду на сервер через мост:'
+    Dim 'шифрование SSH при этом сквозное, пароль сервера мост не видит.'
+    $Jump = "$User@$Bridge"; if ($BridgeSshPort -ne 22) { $Jump = "$User@${Bridge}:$BridgeSshPort" }
+  }
 }
 
-# ---- 2. пакет для сервера: файлы + запуск установки ----
+# ---- 2. пакеты для серверов ----
 $resetVal = ''; if ($Reset) { $resetVal = '1' }
 $noColor = '1'; if ($env:WT_SESSION) { $noColor = '' }   # цвета только в Windows Terminal
-$bundle = (@(
-  'set -e',
-  'umask 077',
-  # у каждого запуска своя папка: повтор не трогает файлы установки, которая ещё идёт
-  'D=/root/.vpn-setup/run-$(date +%Y%m%d-%H%M%S)-$$',
-  'mkdir -p "$D"',
-  "base64 -d > `"`$D/setup.sh`" <<'B64EOF'",
-  (Wrap76 $SetupB64),
-  'B64EOF',
-  "base64 -d > `"`$D/vpn`" <<'B64EOF'",
-  (Wrap76 $VpnB64),
-  'B64EOF',
-  "echo `"$SetupSha  `$D/setup.sh`" | sha256sum -c --quiet >&2",
-  "echo `"$VpnSha  `$D/vpn`" | sha256sum -c --quiet >&2",
-  'install -m 755 "$D/vpn" /usr/local/bin/vpn',
-  'ls -1dt /root/.vpn-setup/run-* 2>/dev/null | tail -n +6 | xargs -r rm -rf',
-  'cd "$D" && : > log.txt',
-  # установка идёт отдельно от SSH-сессии: если связь оборвётся, сервер доведёт её до конца сам
-  "setsid env RESET='$resetVal' NO_COLOR='$noColor' bash setup.sh < /dev/null > out.txt 2> log.txt &",
-  'pid=$!',
-  'tail -n +1 --pid=$pid -f log.txt >&2 || true',
-  'rc=0; wait $pid || rc=$?',
-  'cat out.txt; rm -f out.txt',
-  'exit $rc'
-) -join "`n") + "`n"
-
 $tmp = Join-Path ([IO.Path]::GetTempPath()) ('vpn-setup-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
 New-Item -ItemType Directory -Path $tmp | Out-Null
+function Cleanup { try { Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue } catch {} }
+$utf8 = New-Object System.Text.UTF8Encoding($false)
+
+# ---- 3. мост (только в режиме «мост») ----
+$addBridges = ''
+$binfo = @{}
+if ($Mode -eq 'bridge') {
+  Write-Host ''
+  Write-Host '  Шаг 1 из 2: мост' -ForegroundColor Cyan
+  $bb = New-Bundle 'bridge.sh' $BridgeB64 $BridgeSha "UPSTREAM='$Server' BRIDGE_PORTS='$bPorts' NO_COLOR='$noColor'" $false
+  $bbPath = Join-Path $tmp 'bridge-bundle.sh'; $boPath = Join-Path $tmp 'bridge-out.txt'
+  [IO.File]::WriteAllText($bbPath, $bb, $utf8)
+  Invoke-Remote $Bridge $BridgeSshPort '' $bbPath $boPath 'на мосту'
+  $binfo = Read-Info ([IO.File]::ReadAllText($boPath))
+  $addBridges = "${Bridge}:" + (($bPorts -split ' ')[0] -split ':')[0]
+  Write-Host ''
+  Write-Host '  Шаг 2 из 2: зарубежный сервер (обновляю и добавляю мост)' -ForegroundColor Cyan
+}
+
+# ---- 4. установка на зарубежный сервер ----
+$sb = New-Bundle 'setup.sh' $SetupB64 $SetupSha "RESET='$resetVal' NO_COLOR='$noColor' ADD_BRIDGES='$addBridges'" $true
 $bundlePath = Join-Path $tmp 'bundle.sh'
 $outPath    = Join-Path $tmp 'out.txt'
-[IO.File]::WriteAllText($bundlePath, $bundle, (New-Object System.Text.UTF8Encoding($false)))
-function Cleanup { try { Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue } catch {} }
+[IO.File]::WriteAllText($bundlePath, $sb, $utf8)
+Invoke-Remote $Server $Port $Jump $bundlePath $outPath 'на сервере'
 
-# ---- 3. установка по SSH (один вход — один пароль) ----
-$target  = "$User@$Server"
-$sshOpts = "-p $Port -o StrictHostKeyChecking=accept-new -o LogLevel=ERROR -o ConnectTimeout=20 -o ServerAliveInterval=15 -o ServerAliveCountMax=8"
-$done = $false
-for ($attempt = 1; $attempt -le 5 -and -not $done; $attempt++) {
-  Write-Host ''
-  Say "Подключаюсь к $target."
-  Say 'Сейчас спросят пароль root из письма хостера. Символы при вводе не видны — это нормально.'
-  Dim 'Дальше сервер работает сам — окно не закрывай и Ctrl+C не нажимай. Если окно всё же закроется,'
-  Dim 'сервер доделает установку сам: просто запусти установщик снова, он дождётся и заберёт профиль.'
-  Dim 'Не щёлкай мышью внутри окна: в старой консоли Windows это ставит вывод на паузу (в заголовке'
-  Dim '«Выделить»). Если так вышло — нажми Esc.'
-  Write-Host ''
-  if ($env:VPN_TEST_RUNNER) {
-    & $env:VPN_TEST_RUNNER $bundlePath $outPath        # только для автотестов
-  } else {
-    cmd.exe /d /c "ssh $sshOpts $target bash -s < `"$bundlePath`" > `"$outPath`""
-  }
-  $code = $LASTEXITCODE
-  if ($code -eq 0) { $done = $true; break }
-  Write-Host ''
-  if ($code -ne 255) {
-    Bad "Установка на сервере не завершилась (код $code). Причина — в последних строках выше."
-    Dim 'Повторный запуск установщика безопасен: ключи и настройки сохраняются.'
-    Cleanup; Pause-End; exit 1
-  }
-  Bad 'Не удалось войти на сервер по SSH. Посмотри сообщение выше:'
-  Say '  «Permission denied» — неверный пароль (проверь раскладку EN и Caps Lock);'
-  Say '  «REMOTE HOST IDENTIFICATION HAS CHANGED» — сервер переустанавливали;'
-  Say '  «timed out» / «refused» — сервер недоступен или ещё запускается;'
-  Say '  «Connection closed / reset» посреди установки — оборвалась связь. Сервер закончит установку сам,'
-  Say '     а повтор дождётся её и заберёт профиль (часто виноват включённый VPN — закрой Clash Verge).'
-  $a = (Read-Host '  Enter — повторить, «з» — забыть старый отпечаток сервера и повторить, «в» — выйти').Trim()
-  if ($a -match '^[вВqQ]') { Cleanup; Pause-End; exit 1 }
-  if ($a -match '^[зЗzZ]') {
-    $known = $Server; if ($Port -ne 22) { $known = "[$Server]:$Port" }
-    & ssh-keygen -R $known | Out-Null
-    Good 'Старый отпечаток удалён.'
-  }
-}
-if (-not $done) { Bad 'Не получилось подключиться.'; Cleanup; Pause-End; exit 1 }
-
-# ---- 4. забираем профиль ----
+# ---- 5. забираем профиль ----
 $raw = [IO.File]::ReadAllText($outPath)
-$info = @{}
-$m = [regex]::Match($raw, '===VPN-INFO (?<v>[^\r\n]*?)===')
-if ($m.Success) {
-  foreach ($p in ($m.Groups['v'].Value -split ' ')) {
-    $i = $p.IndexOf('='); if ($i -gt 0) { $info[$p.Substring(0, $i)] = $p.Substring($i + 1) }
-  }
-}
+$info = Read-Info $raw
 $files = [regex]::Matches($raw, '(?s)===VPN-FILE (?<n>[\w.\-]+)===\s*(?<b>[A-Za-z0-9+/=\s]+?)\s*===VPN-END===')
 if ($files.Count -eq 0) {
   Bad "Сервер не вернул профиль. Зайди на сервер (ssh root@$Server) и выполни: vpn status"
   Cleanup; Pause-End; exit 1
 }
-$desk = [Environment]::GetFolderPath('Desktop')
-if (-not $desk -or -not (Test-Path $desk)) { $desk = Join-Path $HOME 'Desktop' }
-if (-not (Test-Path $desk)) { $desk = $HOME }
+$desk = Get-DesktopDir
 $saved = @()
 foreach ($f in $files) {
   $bytes = [Convert]::FromBase64String(($f.Groups['b'].Value -replace '\s', ''))
@@ -251,23 +394,44 @@ foreach ($f in $files) {
 }
 Cleanup   # во временной папке лежал профиль с ключом
 
-# ---- 5. проверка с этого компьютера ----
+# ---- 6. проверка с этого компьютера ----
 Write-Host ''
 $ports = @('443'); if ($info['ports']) { $ports = $info['ports'] -split ',' }
 $blocked = @()
 foreach ($p in $ports) {
-  Write-Host "  Проверяю порт $p с твоего интернета… " -NoNewline
+  Write-Host "  Проверяю порт $p сервера с твоего интернета… " -NoNewline
   if ((Test-Tcp $Server ([int]$p) 8000) -eq 'ok') { Write-Host 'доступен' -ForegroundColor Green }
   else { Write-Host 'НЕ доступен' -ForegroundColor Yellow; $blocked += $p }
 }
-if ($blocked.Count -gt 0) {
+$bridgeBlocked = @()
+if ($Mode -eq 'bridge') {
+  foreach ($m in ($bPorts -split ' ')) {
+    $p = ($m -split ':')[0]
+    Write-Host "  Проверяю порт $p моста с твоего интернета… " -NoNewline
+    if ((Test-Tcp $Bridge ([int]$p) 8000) -eq 'ok') { Write-Host 'доступен' -ForegroundColor Green }
+    else { Write-Host 'НЕ доступен' -ForegroundColor Yellow; $bridgeBlocked += $p }
+  }
+}
+if ($Mode -eq 'bridge') {
+  if ($bridgeBlocked.Count -gt 0) {
+    Warn 'Мост работает, но из твоей сети до него не доходят пакеты. Проверь, не закрыл ли хостер порт,'
+    Warn 'и попробуй с другой сети (раздача с телефона). Если так и останется — попроси хостера сменить IP моста.'
+  } elseif ($blocked.Count -gt 0) {
+    Good 'Сервер из твоей сети напрямую недоступен, а мост — доступен: профиль сам пойдёт через мост.'
+  }
+} elseif ($blocked.Count -gt 0) {
   Warn 'Сервер работает, но часть портов недоступна из твоей сети. Если так и останется —'
   Warn 'IP сервера, скорее всего, блокирует провайдер: попроси хостера сменить IP и запусти установщик снова.'
+  Dim  'Или настрой мост через российский сервер: запусти установщик и выбери «2».'
 }
 
 Write-Host ''
 Good 'Готово.'
 foreach ($s in $saved) { Good "Профиль для компьютера: $s" }
+if ($info['version']) {
+  if ($info['prev_version'] -and $info['prev_version'] -ne $info['version']) { Good "Сервер обновлён: версия $($info['prev_version']) → $($info['version'])." }
+  elseif (-not $info['prev_version']) { Good "На сервере версия $($info['version'])." }
+}
 if ($info['mode'] -eq 'upgrade') {
   if ($info['dest_changed'] -eq '1') {
     Warn "Сайт-прикрытие сменился на $($info['dest']): старые ссылки и профили на телефонах больше не подключатся."
@@ -276,18 +440,40 @@ if ($info['mode'] -eq 'upgrade') {
     Dim 'Это был повторный запуск: ключи сохранены, выданные устройствам доступы работают.'
   }
 }
+# мосты, которые сервер проверил сквозь себя: «IP:1» — работает, «IP:0» — нет
+foreach ($b in (($info['bridges'] + '') -split ',' | Where-Object { $_ })) {
+  $bip = ($b -split ':')[0]
+  if ($b -match ':1$') { Good "Проверка через мост $bip прошла: сервер → мост → сервер → интернет." }
+  else {
+    Warn "Через мост $bip проверка НЕ прошла. Прямое подключение работает."
+    if ($Mode -eq 'bridge' -and $bip -eq $Bridge) { Dim 'Мост настроен, но сквозь него сервер не отвечает. Запусти установщик в режиме «2» ещё раз; не поможет — vpn bridge test на сервере.' }
+    else { Dim "Мост мог отключить хостер. На сервере: vpn bridge test $bip; не нужен — vpn bridge del $bip" }
+  }
+}
 Write-Host ''
+$sshHint = "ssh root@$Server"; if ($Jump) { $sshHint = "ssh -J $Jump root@$Server" }
 Say 'Дальше:'
 Say '  1. Clash Verge → «Профили» → перетащи этот файл в окно и нажми на него, чтобы он стал активным.'
 Say '  2. «Настройки»: «Режим TUN» — ВКЛ, «Системный прокси» — ВЫКЛ. На вкладке «Прокси» режим «Правила».'
-Say '  3. Открой ipleak.net — там должен быть IP сервера.'
-Write-Host ''
-Say 'Телефон или ещё один компьютер — зайди на сервер и выпусти отдельный ключ:'
-Say "  ssh root@$Server"
-Say '  vpn add phone      (ссылка и QR для Happ / v2rayNG / INCY)'
-Say '  vpn yaml phone     (профиль для FlClash на Android — работает надёжнее)'
+Say '  3. Открой ipleak.net — там должен быть IP зарубежного сервера.'
+if ($Mode -eq 'bridge') {
+  Say '  В профиле два пути: напрямую (основной) и через мост — он включается сам, если прямой не отвечает.'
+  Say "  Проверить мост вручную: вкладка «Прокси» → группа PROXY → BRIDGE-$Bridge-… → ipleak.net."
+  Write-Host ''
+  Say 'Телефонам сделай профили заново — в старых нет пути через мост:'
+  Say "  $sshHint"
+  Say '  vpn yaml phone     (профиль для FlClash — в нём оба пути)'
+  Say '  vpn link phone     (ссылки для Happ: прямая и через мост)'
+} else {
+  Write-Host ''
+  Say 'Телефон или ещё один компьютер — зайди на сервер и выпусти отдельный ключ:'
+  Say "  $sshHint"
+  Say '  vpn add phone      (ссылка и QR для Happ / v2rayNG / INCY)'
+  Say '  vpn yaml phone     (профиль для FlClash на Android — работает надёжнее)'
+}
 Say 'Все команды: vpn help.'
-Say 'Не забудь сменить пароль root на сервере: команда passwd.'
+if ($Mode -eq 'bridge') { Say 'Не забудь сменить пароль root на обоих серверах: команда passwd.' }
+else { Say 'Не забудь сменить пароль root на сервере: команда passwd.' }
 if (-not $env:VPN_TEST_RUNNER -and $saved.Count -gt 0) {
   try { Start-Process explorer.exe -ArgumentList "/select,`"$($saved[0])`"" } catch {}
 }

@@ -22,6 +22,7 @@ LOGDIR="${VPN_LOGDIR:-/var/log/xray}"
 PC_KEY="${PC_KEY:-clash}"                  # имя ключа для компьютера
 NEW_PORTS="${PORTS:-443}"                  # порты для новой установки (через пробел)
 SELFTEST_URL="${SELFTEST_URL:-https://www.gstatic.com/generate_204}"
+ADD_BRIDGES="${ADD_BRIDGES:-}"             # мосты через РФ «IP[:порт] …» — добавить (install.ps1, режим «мост»)
 RESET="${RESET:-}"
 SKIP_APT="${SKIP_APT:-}"                   # для тестов
 SKIP_XRAY_INSTALL="${SKIP_XRAY_INSTALL:-}" # для тестов
@@ -412,6 +413,22 @@ case "$code" in
   *) die "Самопроверка не прошла (ответ ${code:-нет}). Настройки оставлены для разбора: vpn status, journalctl -u xray -n 30" ;;
 esac
 
+# мосты через российский сервер: добавить новые и проверить все — сквозь мост, ключом этого сервера
+BR_INFO=""
+for b in $ADD_BRIDGES; do
+  if ! r=$(vpn bridge add "$b" --no-test 2>&1); then
+    die "Мост $b не добавлен: $(sed 's/\x1b\[[0-9;]*m//g' <<<"$r" | tail -1)"
+  fi
+done
+while read -r b bp; do
+  [ -n "$b" ] || continue
+  if vpn bridge test "$b" >/dev/null 2>&1; then ok "запрос через мост $b прошёл"; BR_INFO+="$b:1,"
+  else
+    warn "через мост $b запрос НЕ прошёл. Прямое подключение работает; мост проверь: vpn bridge test $b"
+    BR_INFO+="$b:0,"
+  fi
+done < <(vpn bridge list --plain 2>/dev/null || true)
+
 vpn yaml "$PC_KEY" >/dev/null
 [ -s "$OUT/$PC_KEY.yaml" ] || die "Не удалось собрать профиль для компьютера."
 
@@ -424,7 +441,7 @@ if [ -n "$DEST_CHANGED" ]; then
 fi
 
 # ---- служебный вывод для install.ps1 ----
-echo "===VPN-INFO ip=$IP ports=${PORTS_USE// /,} dest=$DEST mode=$MODE dest_changed=${DEST_CHANGED:-0}==="
+echo "===VPN-INFO ip=$IP ports=${PORTS_USE// /,} dest=$DEST mode=$MODE dest_changed=${DEST_CHANGED:-0} bridges=${BR_INFO%,} version=$(vpn version 2>/dev/null || true)==="
 echo "===VPN-FILE vpn-$PC_KEY.yaml==="
 base64 -w 76 "$OUT/$PC_KEY.yaml"
 echo "===VPN-END==="

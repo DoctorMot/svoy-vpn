@@ -7,8 +7,10 @@ set -uo pipefail
 # перезапускается), команда всё равно доработает до конца: проверка и откат не пропадут.
 trap '' HUP
 
+VPN_VERSION=1.1.0   # версия «Свой VPN»; сверяется с файлом VERSION при сборке (tools/build.py)
 CFG="${VPN_CONFIG:-/usr/local/etc/xray/config.json}"
 OUT="${VPN_OUT:-/root/vpn-keys}"
+BRIDGES="${VPN_BRIDGES:-/etc/svoy-vpn/bridges}"   # мосты через Россию: строки «IP ПОРТ»
 mkdir -p "$OUT"; chmod 700 "$OUT"
 
 red(){ printf '\033[31m%s\033[0m\n' "$*"; }
@@ -67,8 +69,13 @@ check_name() {
   [[ "$1" =~ ^[a-zA-Z0-9_-]{1,32}$ ]] || die "имя «$1» не подходит: только латиница, цифры, - и _, до 32 символов. Пример: phone-anna"
 }
 
-link() {  # link UUID PORT NAME
-  echo "vless://$1@$IP:$2?encryption=none&flow=xtls-rprx-vision&security=reality&sni=$DEST&fp=chrome&pbk=$PUB&sid=$SID&type=tcp&headerType=none#$3-$2"
+link() {  # link UUID PORT NAME [АДРЕС ПОДПИСЬ] — по умолчанию адрес этого сервера
+  echo "vless://$1@${4:-$IP}:$2?encryption=none&flow=xtls-rprx-vision&security=reality&sni=$DEST&fp=chrome&pbk=$PUB&sid=$SID&type=tcp&headerType=none#$3-${5:-$2}"
+}
+
+bridges() {  # мосты: по строке «IP ПОРТ»
+  [ -s "$BRIDGES" ] || return 0
+  awk 'NF >= 2 && $1 ~ /^[0-9.]+$/ && $2 ~ /^[0-9]+$/ {print $1, $2}' "$BRIDGES"
 }
 
 apply() {  # проверить конфиг и перезапустить; при сбое откатить
@@ -134,11 +141,24 @@ cmd_link() {
   local name="${1:-}" want="${2:-}"; [ -n "$name" ] || die "укажите имя: vpn link phone"
   local id; id=$(uuid_of "$name") || die "ключа «$name» нет. Список: vpn list"
   [ -n "${IP:-}" ] || load
-  local first=1 p
+  local first=1 p b bp bip=""
   for p in $PORTS; do
     [ $first = 1 ] && echo "Основная ссылка (порт $p):" || echo "Запасная ссылка (порт $p):"
     link "$id" "$p" "$name"; echo; first=0
   done
+  while read -r b bp; do
+    [ -n "$b" ] || continue
+    echo "Через мост $b (порт $bp) — те же ключи, адрес моста:"
+    link "$id" "$bp" "$name" "$b" "bridge-$b"; echo
+    [ -n "$bip" ] || bip="$b"
+  done < <(bridges)
+  if [ -n "$want" ] && [[ "$want" == *.* ]]; then   # vpn qr ИМЯ IP_МОСТА
+    bp=$(bridges | awk -v b="$want" '$1 == b {print $2; exit}')
+    [ -n "$bp" ] || die "моста $want нет. Список: vpn bridge list"
+    echo "QR ссылки через мост $want — отсканируй приложением на телефоне:"
+    show_qr "$(link "$id" "$bp" "$name" "$want" "bridge-$want")" "$name-bridge-$want"
+    return 0
+  fi
   set -- $PORTS
   local qp="$1"
   if [ -n "$want" ]; then
@@ -152,6 +172,7 @@ cmd_link() {
   fi
   show_qr "$(link "$id" "$qp" "$name")" "$name-$qp"
   [ -z "$want" ] && [ $# -gt 1 ] && dim "QR запасной ссылки: vpn qr $name $2"
+  [ -z "$want" ] && [ -n "$bip" ] && dim "QR ссылки через мост: vpn qr $name $bip"
   return 0
 }
 
@@ -159,12 +180,12 @@ cmd_yaml() {
   local name="${1:-}" mode="${2:-}"; [ -n "$name" ] || die "укажите имя: vpn yaml laptop"
   local id; id=$(uuid_of "$name") || die "ключа «$name» нет. Сначала: vpn add $name"
   load
-  local f="$OUT/$name.yaml" proxies="" names="" p
-  for p in $PORTS; do
-    proxies+="  - name: VLESS-$p
+  local f="$OUT/$name.yaml" proxies="" names="" p b bp bnames="" bdirect=""
+  node() {  # node ИМЯ АДРЕС ПОРТ
+    proxies+="  - name: $1
     type: vless
-    server: $IP
-    port: $p
+    server: $2
+    port: $3
     uuid: \"$id\"
     network: tcp
     tls: true
@@ -177,9 +198,37 @@ cmd_yaml() {
       short-id: \"$SID\"
 
 "
+  }
+  for p in $PORTS; do
+    node "VLESS-$p" "$IP" "$p"
     names+="VLESS-$p, "
   done
+  # узлы через мост: те же ключи, адрес моста — мост пересылает шифрованные байты, не читая их
+  while read -r b bp; do
+    [ -n "$b" ] || continue
+    node "BRIDGE-$b-$bp" "$b" "$bp"
+    bnames+="BRIDGE-$b-$bp, "
+    bdirect+="  - IP-CIDR,$b/32,DIRECT,no-resolve
+"
+  done < <(bridges)
   names="${names%, }"
+  local auto="  - name: AUTO
+    type: url-test
+    proxies: [$names]
+    url: https://cp.cloudflare.com/generate_204
+    interval: 300
+    tolerance: 50"
+  if [ -n "$bnames" ]; then
+    names="$names, ${bnames%, }"
+    # прямой узел основной; мост подхватывает сам, если прямой перестал отвечать
+    auto="  # Основной — прямой узел. Если он перестал отвечать (провайдер режет адрес сервера),
+  # группа сама переходит на мост и возвращается, когда прямой снова заработает.
+  - name: AUTO
+    type: fallback
+    proxies: [$names]
+    url: https://cp.cloudflare.com/generate_204
+    interval: 60"
+  fi
   local ru=""
   if [ "$mode" != "--all" ]; then
     ru="  # Российские сайты — напрямую, мимо США (госуслуги, банки, маркетплейсы)
@@ -234,12 +283,7 @@ proxy-groups:
   - name: PROXY
     type: select
     proxies: [AUTO, $names, DIRECT]
-  - name: AUTO
-    type: url-test
-    proxies: [$names]
-    url: https://cp.cloudflare.com/generate_204
-    interval: 300
-    tolerance: 50
+$auto
   # Режим «Глобальный»: всё через сервер. Без этой группы mihomo выбирает
   # в нём DIRECT, и в «Глобальном» трафик идёт мимо VPN.
   - name: GLOBAL
@@ -256,10 +300,11 @@ rules:
   - DOMAIN-SUFFIX,lan,DIRECT
   - DOMAIN-SUFFIX,local,DIRECT
   - IP-CIDR,$IP/32,DIRECT,no-resolve
-$ru  - MATCH,PROXY
+$bdirect$ru  - MATCH,PROXY
 EOF
   chmod 600 "$f"
   grn "Профиль готов: $f"
+  [ -n "$bnames" ] && dim "Узлы через мост: ${bnames%, }. Основной — прямой, мост включается сам, если прямой не отвечает."
   if [ "$mode" = "--all" ]; then dim "Режим: весь трафик через США."; else dim "Режим: российские сайты напрямую, остальное через США. Всё через США: vpn yaml $name --all"; fi
   echo
   echo "Скачать на компьютер — эту команду вводи в НОВОМ окне PowerShell на компьютере, не здесь:"
@@ -294,6 +339,7 @@ PY
   apply
   rm -f "$OUT/$name.png" "$OUT/$name.yaml"
   for p in $(params | sed -n 4p); do rm -f "$OUT/$name-$p.png"; done
+  rm -f "$OUT/$name-bridge-"*.png
   grn "Ключ «$name» отозван. Устройство с ним больше не подключится."
 }
 
@@ -476,6 +522,111 @@ PY
   esac
 }
 
+# --- мосты через российский сервер ---
+# Мост (bridge.sh) только пересылает TCP на этот сервер: ключей у него нет. Здесь хранится
+# список мостов, чтобы vpn yaml и vpn link выдавали узлы «через мост» с теми же ключами.
+bridge_test() {  # bridge_test IP ПОРТ — запрос в интернет через мост с ключом этого сервера
+  local ip="$1" port="$2" st pid code="" try
+  load
+  st=$(mktemp /tmp/vpn-bridgetest-XXXXXX.json)
+  python3 - "$CFG" "$ip" "$port" "$PUB" > "$st" <<'PY'
+import json, sys
+cfg, ip, port, pub = sys.argv[1:5]
+c = json.load(open(cfg))
+i = [x for x in c["inbounds"] if x.get("protocol") == "vless"][0]
+u = i["settings"]["clients"][0]
+r = i["streamSettings"]["realitySettings"]
+print(json.dumps({
+  "log": {"loglevel": "warning"},
+  "inbounds": [{"listen": "127.0.0.1", "port": 10898, "protocol": "socks", "settings": {"udp": True}}],
+  "outbounds": [{"protocol": "vless", "settings": {"vnext": [{"address": ip, "port": int(port),
+      "users": [{"id": u["id"], "encryption": "none", "flow": "xtls-rprx-vision"}]}]},
+    "streamSettings": {"network": "tcp", "security": "reality", "realitySettings": {
+      "serverName": r["serverNames"][0], "fingerprint": "chrome", "publicKey": pub,
+      "shortId": next((s for s in r["shortIds"] if s), "")}}}]}))
+PY
+  xray run -config "$st" >/dev/null 2>&1 &
+  pid=$!
+  sleep 2
+  for try in 1 2 3; do   # первое соединение после перезапуска Xray бывает медленным
+    code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 --noproxy '' --socks5-hostname 127.0.0.1:10898 \
+           "${SELFTEST_URL:-https://www.gstatic.com/generate_204}" || true)
+    case "$code" in 2*|3*) break ;; esac
+    sleep 2
+  done
+  kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null
+  rm -f "$st"
+  case "$code" in 2*|3*) return 0 ;; *) return 1 ;; esac
+}
+
+cmd_bridge() {
+  local act="${1:-list}" arg="${2:-}" opt="${3:-}" ip port b bp n=0
+  case "$act" in
+    list|ls|"")
+      if [ "$arg" = "--plain" ]; then bridges; return 0; fi   # «IP ПОРТ» — для setup.sh
+      while read -r b bp; do
+        [ -n "$b" ] || continue
+        n=$((n + 1))
+        if timeout 5 bash -c "exec 3<>/dev/tcp/$b/$bp" 2>/dev/null; then echo "  $b порт $bp — отвечает"
+        else red "  $b порт $bp — НЕ отвечает"; fi
+      done < <(bridges)
+      if [ "$n" = 0 ]; then
+        echo "Мостов нет. Добавить: vpn bridge add IP_МОСТА (сначала настрой мост установщиком в режиме «мост»)"
+      else
+        dim "Сквозная проверка: vpn bridge test IP_МОСТА"
+      fi
+      ;;
+    add)
+      [ -n "$arg" ] || die "укажите IP моста: vpn bridge add 203.0.113.20   (или IP:порт, если порт моста не 443)"
+      ip="${arg%%:*}"; port=443; [[ "$arg" == *:* ]] && port="${arg#*:}"
+      [[ "$ip" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || die "«$ip» не похоже на IPv4-адрес моста"
+      [[ "$port" =~ ^[0-9]{1,5}$ ]] && [ "$port" -ge 1 ] && [ "$port" -le 65535 ] || die "«$port» — не порт"
+      case "$ip" in 0.*|127.*|10.*|192.168.*|169.254.*) die "$ip — внутренний адрес, нужен внешний IP моста" ;; esac
+      load
+      [ "$ip" != "$IP" ] || die "$ip — это адрес самого сервера, а нужен адрес моста"
+      mkdir -p "$(dirname "$BRIDGES")"
+      if bridges | grep -Fqx "$ip $port"; then
+        echo "Мост $ip (порт $port) уже в списке."
+      else
+        { bridges | awk -v b="$ip" '$1 != b'; echo "$ip $port"; } > "$BRIDGES.new"
+        { echo "# Мосты «Свой VPN»: IP ПОРТ. Меняется командами vpn bridge add / del."; cat "$BRIDGES.new"; } > "$BRIDGES"
+        rm -f "$BRIDGES.new"
+        grn "Мост $ip (порт $port) добавлен."
+      fi
+      if [ "$opt" != "--no-test" ]; then
+        echo "Проверяю связь через мост…"
+        if bridge_test "$ip" "$port"; then grn "  запрос через мост прошёл"
+        else red "  через мост запрос НЕ прошёл. Мост настроен на этот сервер? Проверка: vpn bridge test $ip"; fi
+      fi
+      echo "Узлы через мост появятся в новых профилях и ссылках: vpn yaml ИМЯ, vpn link ИМЯ."
+      ;;
+    del|rm|delete)
+      [ -n "$arg" ] || die "укажите IP моста: vpn bridge del 203.0.113.20"
+      bridges | awk -v b="$arg" '$1 == b {f=1} END {exit !f}' || die "моста $arg нет. Список: vpn bridge list"
+      { echo "# Мосты «Свой VPN»: IP ПОРТ. Меняется командами vpn bridge add / del."; bridges | awk -v b="$arg" '$1 != b'; } > "$BRIDGES.new"
+      mv "$BRIDGES.new" "$BRIDGES"
+      grn "Мост $arg убран из списка."
+      echo "Сделай профили заново (vpn yaml ИМЯ), иначе в них останется узел через этот мост."
+      ;;
+    test)
+      [ -n "$arg" ] || die "укажите IP моста: vpn bridge test 203.0.113.20"
+      bp=$(bridges | awk -v b="$arg" '$1 == b {print $2; exit}')
+      [ -n "$bp" ] || bp=443
+      echo "Проверяю: этот сервер → мост $arg:$bp → этот сервер → интернет (с ключом этого сервера)…"
+      if bridge_test "$arg" "$bp"; then grn "Через мост $arg всё работает."; return 0; fi
+      red "Через мост $arg запрос НЕ прошёл."
+      if timeout 5 bash -c "exec 3<>/dev/tcp/$arg/$bp" 2>/dev/null; then
+        echo "Порт $bp моста открыт, но до этого сервера не доходит: мост настроен на другой адрес?"
+        echo "Перезапусти установщик в режиме «мост» с IP этого сервера."
+      else
+        echo "Порт $bp моста не отвечает: мост выключен, не настроен или его отключил хостер."
+      fi
+      return 1
+      ;;
+    *) die "используй: vpn bridge list | add IP | del IP | test IP" ;;
+  esac
+}
+
 cmd_status() {
   load
   if systemctl is-active --quiet xray; then grn "Xray работает"; stale_check; else red "Xray НЕ работает — см. journalctl -u xray -n 30"; fi
@@ -497,6 +648,8 @@ cmd_status() {
       if ss -tln 2>/dev/null | grep -q ":$p "; then echo "  порт $p слушается"; else red "  порт $p НЕ слушается"; fi
     done
   fi
+  echo "Мосты:             $(bridges | awk '{printf "%s%s:%s", (NR > 1 ? ", " : ""), $1, $2}' | grep . || echo нет)"
+  echo "Версия «Свой VPN»: $VPN_VERSION"
   cmd_list
 }
 
@@ -517,6 +670,15 @@ vpn — ключи для твоего VLESS-сервера
   vpn dest auto         сменить сайт-прикрытие на подходящий (потом обнови ссылки на всех устройствах)
   vpn dns               проверить DNS на сервере;  vpn dns on — сервер сам отвечает на DNS телефонов
 
+Мост через российский сервер (сам мост настраивает установщик в режиме «мост»):
+  vpn bridge list       какие мосты есть и отвечают ли они
+  vpn bridge add IP     добавить мост: узел «через мост» появится в vpn yaml и vpn link
+  vpn bridge test IP    сквозная проверка: этот сервер → мост → этот сервер → интернет
+  vpn bridge del IP     убрать мост (потом сделай профили заново)
+  vpn qr ИМЯ IP_МОСТА   QR ссылки через мост
+
+  vpn version           версия «Свой VPN» на этом сервере
+
 Имена — латиницей: phone, phone-mama, laptop, ipad…
 Ключ «clash» — это компьютер, который настроил скрипт из видео.
 EOF
@@ -532,5 +694,7 @@ case "${1:-help}" in
   log) cmd_log "${2:-}" ;;
   dest) cmd_dest "${2:-}" ;;
   dns) cmd_dns "${2:-}" ;;
+  bridge|bridges) cmd_bridge "${2:-}" "${3:-}" "${4:-}" ;;
+  version|--version|-v) echo "$VPN_VERSION" ;;
   *) cmd_help ;;
 esac
