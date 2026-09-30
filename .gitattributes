@@ -1,0 +1,9 @@
+# Серверные скрипты — только LF, иначе bash на сервере споткнётся о \r
+*.sh        text eol=lf
+server/vpn  text eol=lf
+*.py        text eol=lf
+*.in        text eol=lf
+# Windows-файлы хранятся как есть (CRLF + BOM для кириллицы в PowerShell 5.1),
+# чтобы и ZIP, и raw-ссылка отдавали их без преобразований
+*.ps1       -text
+*.cmd       -text
