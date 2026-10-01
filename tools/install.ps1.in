@@ -14,7 +14,8 @@
     -Port 22               порт SSH сервера, если хостер дал другой
     -Bridge 198.51.100.7   IP российского сервера — режим «мост»
     -BridgeSshPort 22      порт SSH моста
-    -BridgePorts 443       порт моста; «443:8443» — порт моста:порт сервера
+    -BridgePorts '443 8443' порты моста (первый — основной, 8443 — запасной gRPC);
+                           «443:8443» — порт моста:порт сервера
     -Reset                 выпустить новые ключи (старые перестанут работать)
     -Verify                только сверить вшитые файлы с папкой server\ и выйти
 
@@ -31,7 +32,7 @@ param(
   [string]$User = 'root',
   [string]$Bridge = '',
   [int]$BridgeSshPort = 22,
-  [string]$BridgePorts = '443',
+  [string]$BridgePorts = '443 8443',
   [switch]$Reset,
   [switch]$Verify
 )
@@ -163,7 +164,7 @@ function New-Bundle([string]$Name, [string]$B64, [string]$Sha, [string]$EnvVars,
   if ($WithVpn) {
     $l += "echo `"$VpnSha  `$D/vpn`" | sha256sum -c --quiet >&2"
     # какая версия стояла до обновления: помощник с 1.1.0 знает свою версию, более старые — нет
-    $l += 'if [ -x /usr/local/bin/vpn ]; then v=$(sed -n "s/^VPN_VERSION=//p" /usr/local/bin/vpn | head -1); echo "===VPN-PREV version=${v:-1.0.x}==="; fi'
+    $l += 'if [ -x /usr/local/bin/vpn ]; then v=$(sed -n "s/^VPN_VERSION=\([0-9.]*\).*/\1/p" /usr/local/bin/vpn | head -1); echo "===VPN-PREV version=${v:-1.0.x}==="; fi'
     $l += 'install -m 755 "$D/vpn" /usr/local/bin/vpn'
   }
   $l += @(
@@ -397,19 +398,30 @@ Cleanup   # во временной папке лежал профиль с кл
 # ---- 6. проверка с этого компьютера ----
 Write-Host ''
 $ports = @('443'); if ($info['ports']) { $ports = $info['ports'] -split ',' }
+# запасной gRPC (vpn grpc on): «ПОРТ:1» — работает, дальше — «IP_МОСТА:1» через мосты
+$grpc = @(($info['grpc'] + '') -split ',' | Where-Object { $_ })
+$grpcPort = ''; if ($grpc.Count -gt 0) { $grpcPort = ($grpc[0] -split ':')[0] }
 $blocked = @()
 foreach ($p in $ports) {
   Write-Host "  Проверяю порт $p сервера с твоего интернета… " -NoNewline
   if ((Test-Tcp $Server ([int]$p) 8000) -eq 'ok') { Write-Host 'доступен' -ForegroundColor Green }
   else { Write-Host 'НЕ доступен' -ForegroundColor Yellow; $blocked += $p }
 }
+if ($grpcPort) {
+  Write-Host "  Проверяю порт $grpcPort сервера (запасной gRPC)… " -NoNewline
+  if ((Test-Tcp $Server ([int]$grpcPort) 8000) -eq 'ok') { Write-Host 'доступен' -ForegroundColor Green }
+  else { Write-Host 'НЕ доступен' -ForegroundColor Yellow }
+}
 $bridgeBlocked = @()
 if ($Mode -eq 'bridge') {
-  foreach ($m in ($bPorts -split ' ')) {
-    $p = ($m -split ':')[0]
+  # основной порт моста — всегда; запасные (gRPC) — только если gRPC включён: иначе сервер держит их закрытыми
+  $bp = @(($bPorts -split ' ') | ForEach-Object { ($_ -split ':')[0] })
+  $check = @($bp[0]); if ($grpcPort -and $bp.Count -gt 1) { $check += $bp[1..($bp.Count - 1)] }
+  foreach ($p in $check) {
     Write-Host "  Проверяю порт $p моста с твоего интернета… " -NoNewline
     if ((Test-Tcp $Bridge ([int]$p) 8000) -eq 'ok') { Write-Host 'доступен' -ForegroundColor Green }
-    else { Write-Host 'НЕ доступен' -ForegroundColor Yellow; $bridgeBlocked += $p }
+    elseif ($p -eq $bp[0]) { Write-Host 'НЕ доступен' -ForegroundColor Yellow; $bridgeBlocked += $p }
+    else { Write-Host 'НЕ доступен' -ForegroundColor Yellow }
   }
 }
 if ($Mode -eq 'bridge') {
@@ -448,6 +460,15 @@ foreach ($b in (($info['bridges'] + '') -split ',' | Where-Object { $_ })) {
     Warn "Через мост $bip проверка НЕ прошла. Прямое подключение работает."
     if ($Mode -eq 'bridge' -and $bip -eq $Bridge) { Dim 'Мост настроен, но сквозь него сервер не отвечает. Запусти установщик в режиме «2» ещё раз; не поможет — vpn bridge test на сервере.' }
     else { Dim "Мост мог отключить хостер. На сервере: vpn bridge test $bip; не нужен — vpn bridge del $bip" }
+  }
+}
+if ($grpcPort) {
+  if ($grpc[0] -match ':1$') { Good "Запасной транспорт gRPC (порт $grpcPort) работает — в профиле он первый." }
+  else { Warn "Запасной транспорт gRPC (порт $grpcPort) НЕ прошёл проверку. Обычное подключение работает; на сервере: vpn grpc" }
+  foreach ($g in ($grpc | Select-Object -Skip 1)) {
+    $gip = ($g -split ':')[0]
+    if ($g -match ':1$') { Good "gRPC через мост $gip работает." }
+    else { Warn "gRPC через мост $gip НЕ прошёл: мост не пересылает порт $grpcPort. Запусти установщик в режиме «2» ещё раз." }
   }
 }
 Write-Host ''

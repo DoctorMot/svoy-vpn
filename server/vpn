@@ -7,10 +7,11 @@ set -uo pipefail
 # перезапускается), команда всё равно доработает до конца: проверка и откат не пропадут.
 trap '' HUP
 
-VPN_VERSION=1.1.0   # версия «Свой VPN»; сверяется с файлом VERSION при сборке (tools/build.py)
+VPN_VERSION=1.2.0   # версия «Свой VPN»; сверяется с файлом VERSION при сборке (tools/build.py)
 CFG="${VPN_CONFIG:-/usr/local/etc/xray/config.json}"
 OUT="${VPN_OUT:-/root/vpn-keys}"
 BRIDGES="${VPN_BRIDGES:-/etc/svoy-vpn/bridges}"   # мосты через Россию: строки «IP ПОРТ»
+GPORT=""; GSVC=""                                  # запасной вход gRPC (vpn grpc on) — заполняет load
 mkdir -p "$OUT"; chmod 700 "$OUT"
 
 red(){ printf '\033[31m%s\033[0m\n' "$*"; }
@@ -23,15 +24,21 @@ command -v python3 >/dev/null || die "нет python3"
 command -v xray >/dev/null || die "нет xray"
 
 # --- параметры сервера из config.json ---
+# Обычные входы — TCP (с Vision). Запасной вход gRPC (vpn grpc on) — отдельно: порт и serviceName.
 params() {
 python3 - "$CFG" <<'PY'
 import json, sys
 c = json.load(open(sys.argv[1]))
 v = [i for i in c.get("inbounds", []) if i.get("protocol") == "vless"]
 if not v: sys.exit("в конфиге нет vless-подключений")
-r = v[0]["streamSettings"]["realitySettings"]
+net = lambda i: i.get("streamSettings", {}).get("network") or "tcp"
+t = [i for i in v if net(i) != "grpc"] or v
+g = [i for i in v if net(i) == "grpc"]
+r = t[0]["streamSettings"]["realitySettings"]
 print(r["privateKey"]); print(r["serverNames"][0]); print(next((x for x in r["shortIds"] if x), ""))
-print(" ".join(str(i["port"]) for i in v))
+print(" ".join(str(i["port"]) for i in t))
+print(g[0]["port"] if g else "")
+print(g[0]["streamSettings"].get("grpcSettings", {}).get("serviceName", "") if g else "")
 PY
 }
 
@@ -47,7 +54,7 @@ server_ip() {
 
 load() {
   mapfile -t P < <(params) || die "не удалось прочитать $CFG"
-  PRIV="${P[0]}"; DEST="${P[1]}"; SID="${P[2]}"; PORTS="${P[3]}"
+  PRIV="${P[0]}"; DEST="${P[1]}"; SID="${P[2]}"; PORTS="${P[3]}"; GPORT="${P[4]:-}"; GSVC="${P[5]:-}"
   PUB=$(xray x25519 -i "$PRIV" 2>/dev/null | awk -F': *' '/^(Password|PublicKey|Public key)/{print $2; exit}')
   [ -n "$PUB" ] || die "не удалось вычислить публичный ключ (xray x25519 -i)"
   IP=$(server_ip)
@@ -71,6 +78,10 @@ check_name() {
 
 link() {  # link UUID PORT NAME [АДРЕС ПОДПИСЬ] — по умолчанию адрес этого сервера
   echo "vless://$1@${4:-$IP}:$2?encryption=none&flow=xtls-rprx-vision&security=reality&sni=$DEST&fp=chrome&pbk=$PUB&sid=$SID&type=tcp&headerType=none#$3-${5:-$2}"
+}
+
+glink() {  # glink UUID NAME [АДРЕС ПОДПИСЬ] — ссылка на запасной вход gRPC (без Vision)
+  echo "vless://$1@${3:-$IP}:$GPORT?encryption=none&security=reality&sni=$DEST&fp=chrome&pbk=$PUB&sid=$SID&type=grpc&serviceName=$GSVC&mode=gun#$2-${4:-grpc}"
 }
 
 bridges() {  # мосты: по строке «IP ПОРТ»
@@ -129,7 +140,8 @@ p, uid, name = sys.argv[1:4]
 c = json.load(open(p))
 for i in c["inbounds"]:
     if i.get("protocol") == "vless":
-        i["settings"]["clients"].append({"id": uid, "flow": "xtls-rprx-vision", "email": name})
+        grpc = i.get("streamSettings", {}).get("network") == "grpc"   # Vision работает только поверх TCP
+        i["settings"]["clients"].append({"id": uid, "flow": "" if grpc else "xtls-rprx-vision", "email": name})
 json.dump(c, open(p, "w"), indent=2)
 PY
   apply
@@ -138,7 +150,7 @@ PY
 }
 
 cmd_link() {
-  local name="${1:-}" want="${2:-}"; [ -n "$name" ] || die "укажите имя: vpn link phone"
+  local name="${1:-}" want="${2:-}" want2="${3:-}"; [ -n "$name" ] || die "укажите имя: vpn link phone"
   local id; id=$(uuid_of "$name") || die "ключа «$name» нет. Список: vpn list"
   [ -n "${IP:-}" ] || load
   local first=1 p b bp bip=""
@@ -152,6 +164,27 @@ cmd_link() {
     link "$id" "$bp" "$name" "$b" "bridge-$b"; echo
     [ -n "$bip" ] || bip="$b"
   done < <(bridges)
+  if [ -n "$GPORT" ]; then
+    echo "Запасной транспорт gRPC (порт $GPORT) — если обычные ссылки перестали работать:"
+    glink "$id" "$name"; echo
+    while read -r b bp; do
+      [ -n "$b" ] || continue
+      echo "gRPC через мост $b (порт $GPORT):"
+      glink "$id" "$name" "$b" "grpc-bridge-$b"; echo
+    done < <(bridges)
+  fi
+  if [ "$want" = grpc ]; then   # vpn qr ИМЯ grpc [IP_МОСТА]
+    [ -n "$GPORT" ] || die "запасной транспорт gRPC выключен. Включить: vpn grpc on"
+    if [ -n "$want2" ]; then
+      bridges | awk -v b="$want2" '$1 == b {f=1} END {exit !f}' || die "моста $want2 нет. Список: vpn bridge list"
+      echo "QR ссылки gRPC через мост $want2 — отсканируй приложением на телефоне:"
+      show_qr "$(glink "$id" "$name" "$want2" "grpc-bridge-$want2")" "$name-grpc-bridge-$want2"
+    else
+      echo "QR ссылки gRPC — отсканируй приложением на телефоне:"
+      show_qr "$(glink "$id" "$name")" "$name-grpc"
+    fi
+    return 0
+  fi
   if [ -n "$want" ] && [[ "$want" == *.* ]]; then   # vpn qr ИМЯ IP_МОСТА
     bp=$(bridges | awk -v b="$want" '$1 == b {print $2; exit}')
     [ -n "$bp" ] || die "моста $want нет. Список: vpn bridge list"
@@ -173,6 +206,7 @@ cmd_link() {
   show_qr "$(link "$id" "$qp" "$name")" "$name-$qp"
   [ -z "$want" ] && [ $# -gt 1 ] && dim "QR запасной ссылки: vpn qr $name $2"
   [ -z "$want" ] && [ -n "$bip" ] && dim "QR ссылки через мост: vpn qr $name $bip"
+  [ -z "$want" ] && [ -n "$GPORT" ] && dim "QR ссылки gRPC: vpn qr $name grpc${bip:+   (через мост: vpn qr $name grpc $bip)}"
   return 0
 }
 
@@ -180,7 +214,7 @@ cmd_yaml() {
   local name="${1:-}" mode="${2:-}"; [ -n "$name" ] || die "укажите имя: vpn yaml laptop"
   local id; id=$(uuid_of "$name") || die "ключа «$name» нет. Сначала: vpn add $name"
   load
-  local f="$OUT/$name.yaml" proxies="" names="" p b bp bnames="" bdirect=""
+  local f="$OUT/$name.yaml" proxies="" names="" p b bp bnames="" bdirect="" gproxies="" gnames=""
   node() {  # node ИМЯ АДРЕС ПОРТ
     proxies+="  - name: $1
     type: vless
@@ -199,15 +233,37 @@ cmd_yaml() {
 
 "
   }
+  gnode() {  # gnode ИМЯ АДРЕС — запасной вход gRPC: те же ключи, другой «почерк» трафика, без Vision
+    gproxies+="  - name: $1
+    type: vless
+    server: $2
+    port: $GPORT
+    uuid: \"$id\"
+    network: grpc
+    tls: true
+    udp: true
+    servername: $DEST
+    client-fingerprint: chrome
+    reality-opts:
+      public-key: \"$PUB\"
+      short-id: \"$SID\"
+    grpc-opts:
+      grpc-service-name: \"$GSVC\"
+
+"
+    gnames+="$1, "
+  }
   for p in $PORTS; do
     node "VLESS-$p" "$IP" "$p"
     names+="VLESS-$p, "
   done
+  [ -n "$GPORT" ] && gnode "GRPC-$GPORT" "$IP"
   # узлы через мост: те же ключи, адрес моста — мост пересылает шифрованные байты, не читая их
   while read -r b bp; do
     [ -n "$b" ] || continue
     node "BRIDGE-$b-$bp" "$b" "$bp"
     bnames+="BRIDGE-$b-$bp, "
+    [ -n "$GPORT" ] && gnode "BRIDGE-GRPC-$b-$GPORT" "$b"
     bdirect+="  - IP-CIDR,$b/32,DIRECT,no-resolve
 "
   done < <(bridges)
@@ -218,7 +274,18 @@ cmd_yaml() {
     url: https://cp.cloudflare.com/generate_204
     interval: 300
     tolerance: 50"
-  if [ -n "$bnames" ]; then
+  if [ -n "$gnames" ]; then
+    # gRPC включают, когда обычный протокол распознают, — тогда он первый
+    proxies="$gproxies$proxies"
+    names="${gnames%, }, $names${bnames:+, ${bnames%, }}"
+    auto="  # Первым — запасной транспорт gRPC (включён командой vpn grpc on): напрямую, потом через мост.
+  # Если он не отвечает — обычный узел напрямую, потом через мост. Группа переключается сама.
+  - name: AUTO
+    type: fallback
+    proxies: [$names]
+    url: https://cp.cloudflare.com/generate_204
+    interval: 60"
+  elif [ -n "$bnames" ]; then
     names="$names, ${bnames%, }"
     # прямой узел основной; мост подхватывает сам, если прямой перестал отвечать
     auto="  # Основной — прямой узел. Если он перестал отвечать (провайдер режет адрес сервера),
@@ -304,7 +371,8 @@ $bdirect$ru  - MATCH,PROXY
 EOF
   chmod 600 "$f"
   grn "Профиль готов: $f"
-  [ -n "$bnames" ] && dim "Узлы через мост: ${bnames%, }. Основной — прямой, мост включается сам, если прямой не отвечает."
+  if [ -n "$gnames" ]; then dim "Запасной транспорт gRPC включён: ${gnames%, } — первые в группе AUTO."
+  elif [ -n "$bnames" ]; then dim "Узлы через мост: ${bnames%, }. Основной — прямой, мост включается сам, если прямой не отвечает."; fi
   if [ "$mode" = "--all" ]; then dim "Режим: весь трафик через США."; else dim "Режим: российские сайты напрямую, остальное через США. Всё через США: vpn yaml $name --all"; fi
   echo
   echo "Скачать на компьютер — эту команду вводи в НОВОМ окне PowerShell на компьютере, не здесь:"
@@ -339,7 +407,7 @@ PY
   apply
   rm -f "$OUT/$name.png" "$OUT/$name.yaml"
   for p in $(params | sed -n 4p); do rm -f "$OUT/$name-$p.png"; done
-  rm -f "$OUT/$name-bridge-"*.png
+  rm -f "$OUT/$name-bridge-"*.png "$OUT/$name-grpc"*.png
   grn "Ключ «$name» отозван. Устройство с ним больше не подключится."
 }
 
@@ -525,25 +593,27 @@ PY
 # --- мосты через российский сервер ---
 # Мост (bridge.sh) только пересылает TCP на этот сервер: ключей у него нет. Здесь хранится
 # список мостов, чтобы vpn yaml и vpn link выдавали узлы «через мост» с теми же ключами.
-bridge_test() {  # bridge_test IP ПОРТ — запрос в интернет через мост с ключом этого сервера
-  local ip="$1" port="$2" st pid code="" try
+client_test() {  # client_test АДРЕС ПОРТ [grpc] — запрос в интернет через АДРЕС:ПОРТ с ключом этого сервера
+  local ip="$1" port="$2" net="${3:-tcp}" st pid code="" try
   load
-  st=$(mktemp /tmp/vpn-bridgetest-XXXXXX.json)
-  python3 - "$CFG" "$ip" "$port" "$PUB" > "$st" <<'PY'
+  st=$(mktemp /tmp/vpn-clienttest-XXXXXX.json)
+  python3 - "$CFG" "$ip" "$port" "$PUB" "$net" "$GSVC" > "$st" <<'PY'
 import json, sys
-cfg, ip, port, pub = sys.argv[1:5]
+cfg, ip, port, pub, net, svc = sys.argv[1:7]
 c = json.load(open(cfg))
 i = [x for x in c["inbounds"] if x.get("protocol") == "vless"][0]
 u = i["settings"]["clients"][0]
 r = i["streamSettings"]["realitySettings"]
+ss = {"network": net, "security": "reality", "realitySettings": {
+      "serverName": r["serverNames"][0], "fingerprint": "chrome", "publicKey": pub,
+      "shortId": next((s for s in r["shortIds"] if s), "")}}
+if net == "grpc": ss["grpcSettings"] = {"serviceName": svc}
 print(json.dumps({
   "log": {"loglevel": "warning"},
   "inbounds": [{"listen": "127.0.0.1", "port": 10898, "protocol": "socks", "settings": {"udp": True}}],
   "outbounds": [{"protocol": "vless", "settings": {"vnext": [{"address": ip, "port": int(port),
-      "users": [{"id": u["id"], "encryption": "none", "flow": "xtls-rprx-vision"}]}]},
-    "streamSettings": {"network": "tcp", "security": "reality", "realitySettings": {
-      "serverName": r["serverNames"][0], "fingerprint": "chrome", "publicKey": pub,
-      "shortId": next((s for s in r["shortIds"] if s), "")}}}]}))
+      "users": [{"id": u["id"], "encryption": "none", "flow": "" if net == "grpc" else "xtls-rprx-vision"}]}]},
+    "streamSettings": ss}]}))
 PY
   xray run -config "$st" >/dev/null 2>&1 &
   pid=$!
@@ -595,7 +665,7 @@ cmd_bridge() {
       fi
       if [ "$opt" != "--no-test" ]; then
         echo "Проверяю связь через мост…"
-        if bridge_test "$ip" "$port"; then grn "  запрос через мост прошёл"
+        if client_test "$ip" "$port"; then grn "  запрос через мост прошёл"
         else red "  через мост запрос НЕ прошёл. Мост настроен на этот сервер? Проверка: vpn bridge test $ip"; fi
       fi
       echo "Узлы через мост появятся в новых профилях и ссылках: vpn yaml ИМЯ, vpn link ИМЯ."
@@ -613,7 +683,14 @@ cmd_bridge() {
       bp=$(bridges | awk -v b="$arg" '$1 == b {print $2; exit}')
       [ -n "$bp" ] || bp=443
       echo "Проверяю: этот сервер → мост $arg:$bp → этот сервер → интернет (с ключом этого сервера)…"
-      if bridge_test "$arg" "$bp"; then grn "Через мост $arg всё работает."; return 0; fi
+      if client_test "$arg" "$bp"; then
+        grn "Через мост $arg всё работает."
+        if [ -n "$GPORT" ]; then
+          if client_test "$arg" "$GPORT" grpc; then grn "gRPC через мост $arg тоже работает."
+          else red "gRPC через мост $arg НЕ проходит: мост не пересылает порт $GPORT. Запусти установщик в режиме «мост» ещё раз."; fi
+        fi
+        return 0
+      fi
       red "Через мост $arg запрос НЕ прошёл."
       if timeout 5 bash -c "exec 3<>/dev/tcp/$arg/$bp" 2>/dev/null; then
         echo "Порт $bp моста открыт, но до этого сервера не доходит: мост настроен на другой адрес?"
@@ -624,6 +701,111 @@ cmd_bridge() {
       return 1
       ;;
     *) die "используй: vpn bridge list | add IP | del IP | test IP" ;;
+  esac
+}
+
+# --- запасной транспорт gRPC ---
+# Те же ключи и маскировка, но поток упакован в gRPC (HTTP/2) — другой «почерк» трафика.
+# Включают, только если провайдер начал распознавать обычный протокол (VLESS + TCP + REALITY).
+# По умолчанию выключен; повторный запуск установщика его сохраняет.
+ufw_port() {  # ufw_port allow|delete ПОРТ — если firewall включён
+  command -v ufw >/dev/null 2>&1 || return 0
+  ufw status 2>/dev/null | grep -q '^Status: active' || return 0
+  if [ "$1" = allow ]; then ufw allow "$2"/tcp >/dev/null; else ufw delete allow "$2"/tcp >/dev/null 2>&1 || true; fi
+}
+
+grpc_tests() {  # проверка gRPC напрямую и через все мосты
+  local b bp
+  if client_test 127.0.0.1 "$GPORT" grpc; then grn "  запрос через gRPC прошёл"
+  else red "  запрос через gRPC НЕ прошёл — журнал: journalctl -u xray -n 30"; fi
+  while read -r b bp; do
+    [ -n "$b" ] || continue
+    if client_test "$b" "$GPORT" grpc; then grn "  gRPC через мост $b прошёл"
+    else red "  gRPC через мост $b НЕ прошёл: мост не пересылает порт $GPORT. Запусти установщик в режиме «мост» ещё раз."; fi
+  done < <(bridges)
+}
+
+cmd_grpc() {
+  local act="${1:-status}" arg="${2:-}" port
+  load
+  case "$act" in
+    status|"")
+      if [ -z "$GPORT" ]; then
+        echo "Запасной транспорт gRPC: выключен."
+        dim "Включать, только если обычный VPN перестал работать и напрямую, и через мост: vpn grpc on"
+      else
+        echo "Запасной транспорт gRPC: включён, порт $GPORT."
+        grpc_tests
+      fi
+      ;;
+    on)
+      if [ -n "$GPORT" ]; then
+        ufw_port allow "$GPORT"
+        echo "Запасной транспорт gRPC уже включён (порт $GPORT). Проверяю…"; grpc_tests; return 0
+      fi
+      port="${arg:-8443}"
+      [[ "$port" =~ ^[0-9]{1,5}$ ]] && [ "$port" -ge 1 ] && [ "$port" -le 65535 ] || die "«$port» — не порт"
+      [[ " $PORTS " != *" $port "* ]] || die "порт $port занят обычным входом VPN. Укажи другой: vpn grpc on 2053 (через мост пойдёт, только если мост пересылает этот порт)"
+      if command -v ss >/dev/null && ss -tln 2>/dev/null | awk '{print $4}' | grep -qE "[:.]$port\$"; then
+        die "порт $port уже занят другой программой. Укажи другой: vpn grpc on 2053"
+      fi
+      backup
+      python3 - "$CFG" "$port" <<'PY'
+import json, secrets, sys
+p, port = sys.argv[1], int(sys.argv[2])
+c = json.load(open(p))
+v = [i for i in c["inbounds"] if i.get("protocol") == "vless"]
+t = [i for i in v if (i.get("streamSettings", {}).get("network") or "tcp") != "grpc"]
+src = (t or v)[0]
+clients, seen = [], set()
+for i in v:
+    for u in i["settings"]["clients"]:
+        k = u.get("email") or u["id"]
+        if k in seen: continue
+        seen.add(k)
+        clients.append({"id": u["id"], "flow": "", "email": u.get("email") or u["id"][:8]})   # Vision — только поверх TCP
+r = dict(src["streamSettings"]["realitySettings"])
+c["inbounds"].append({
+    "tag": f"vless-grpc-{port}", "listen": "0.0.0.0", "port": port, "protocol": "vless",
+    "settings": {"clients": clients, "decryption": "none"},
+    "streamSettings": {"network": "grpc", "security": "reality", "realitySettings": r,
+                       "grpcSettings": {"serviceName": secrets.token_hex(6)}},
+    "sniffing": src.get("sniffing", {"enabled": True, "destOverride": ["http", "tls", "quic"], "routeOnly": True}),
+})
+json.dump(c, open(p, "w"), indent=2)
+PY
+      apply
+      load
+      ufw_port allow "$GPORT"
+      grn "Готово: запасной транспорт gRPC включён на порту $GPORT."
+      echo "Проверяю…"; grpc_tests
+      echo
+      echo "Дальше:"
+      echo "  компьютер — запусти установщик ещё раз (есть мост — режим 2): новый профиль ляжет на рабочий стол;"
+      echo "  телефоны  — vpn yaml ИМЯ (FlClash) или vpn link ИМЯ (ссылка gRPC для Happ / v2rayNG)."
+      dim "В новом профиле gRPC идёт первым, обычный протокол — запасным. Выключить: vpn grpc off"
+      ;;
+    off)
+      [ -n "$GPORT" ] || { echo "Запасной транспорт gRPC и так выключен."; return 0; }
+      backup
+      python3 - "$CFG" <<'PY'
+import json, sys
+p = sys.argv[1]
+c = json.load(open(p))
+c["inbounds"] = [i for i in c["inbounds"] if i.get("streamSettings", {}).get("network") != "grpc"]
+json.dump(c, open(p, "w"), indent=2)
+PY
+      apply
+      ufw_port delete "$GPORT"
+      grn "Готово: запасной транспорт gRPC выключен (порт $GPORT закрыт)."
+      echo "Сделай профили заново: компьютер — установщик, телефоны — vpn yaml ИМЯ / vpn link ИМЯ."
+      ;;
+    test)
+      [ -n "$GPORT" ] || die "запасной транспорт gRPC выключен. Включить: vpn grpc on"
+      if [ -n "$arg" ]; then client_test "$arg" "$GPORT" grpc; return $?; fi   # для setup.sh: только код возврата
+      client_test 127.0.0.1 "$GPORT" grpc; return $?
+      ;;
+    *) die "используй: vpn grpc | vpn grpc on [ПОРТ] | vpn grpc off" ;;
   esac
 }
 
@@ -647,6 +829,12 @@ cmd_status() {
     for p in $PORTS; do
       if ss -tln 2>/dev/null | grep -q ":$p "; then echo "  порт $p слушается"; else red "  порт $p НЕ слушается"; fi
     done
+  fi
+  if [ -n "$GPORT" ]; then
+    echo "Запасной gRPC:     порт $GPORT"
+    if command -v ss >/dev/null && ! ss -tln 2>/dev/null | grep -q ":$GPORT "; then red "  порт $GPORT НЕ слушается"; fi
+  else
+    echo "Запасной gRPC:     выключен (vpn grpc on — включить, если обычный VPN распознают)"
   fi
   echo "Мосты:             $(bridges | awk '{printf "%s%s:%s", (NR > 1 ? ", " : ""), $1, $2}' | grep . || echo нет)"
   echo "Версия «Свой VPN»: $VPN_VERSION"
@@ -677,6 +865,12 @@ vpn — ключи для твоего VLESS-сервера
   vpn bridge del IP     убрать мост (потом сделай профили заново)
   vpn qr ИМЯ IP_МОСТА   QR ссылки через мост
 
+Запасной транспорт gRPC — только если обычный VPN перестал работать и напрямую, и через мост:
+  vpn grpc              включён ли и работает ли
+  vpn grpc on           включить (порт 8443), потом новые профили: установщик, vpn yaml / vpn link
+  vpn grpc off          выключить
+  vpn qr ИМЯ grpc       QR ссылки gRPC (через мост: vpn qr ИМЯ grpc IP_МОСТА)
+
   vpn version           версия «Свой VPN» на этом сервере
 
 Имена — латиницей: phone, phone-mama, laptop, ipad…
@@ -688,13 +882,14 @@ case "${1:-help}" in
   status) cmd_status ;;
   list|ls) cmd_list ;;
   add) cmd_add "${2:-}" ;;
-  link|show|qr) cmd_link "${2:-}" "${3:-}" ;;
+  link|show|qr) cmd_link "${2:-}" "${3:-}" "${4:-}" ;;
   yaml|clash) cmd_yaml "${2:-}" "${3:-}" ;;
   del|rm|delete) cmd_del "${2:-}" ;;
   log) cmd_log "${2:-}" ;;
   dest) cmd_dest "${2:-}" ;;
   dns) cmd_dns "${2:-}" ;;
   bridge|bridges) cmd_bridge "${2:-}" "${3:-}" "${4:-}" ;;
+  grpc) cmd_grpc "${2:-}" "${3:-}" ;;
   version|--version|-v) echo "$VPN_VERSION" ;;
   *) cmd_help ;;
 esac

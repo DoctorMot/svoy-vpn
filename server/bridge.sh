@@ -15,9 +15,10 @@
 # Весь человекочитаемый вывод идёт в stderr, в stdout — только служебная строка ===VPN-INFO …===.
 set -Eeuo pipefail
 
-VERSION=1.1.0                               # сверяется с файлом VERSION при сборке (tools/build.py)
+VERSION=1.2.0                               # сверяется с файлом VERSION при сборке (tools/build.py)
 UPSTREAM="${UPSTREAM:-}"                    # IP зарубежного сервера
-BRIDGE_PORTS="${BRIDGE_PORTS:-443}"         # «443» или «443:8443» (порт моста:порт сервера), через пробел
+BRIDGE_PORTS="${BRIDGE_PORTS:-443 8443}"    # «443» или «443:8443» (порт моста:порт сервера), через пробел;
+                                            # первый — основной, остальные — запасные (8443 — gRPC, vpn grpc on)
 DIR="${BRIDGE_DIR:-/etc/svoy-vpn}"          # настройки моста
 UNIT_DIR="${BRIDGE_UNIT_DIR:-/etc/systemd/system}"
 SKIP_APT="${SKIP_APT:-}"                    # для тестов
@@ -306,16 +307,20 @@ say "Пароль root установщик не меняет. Смени его
 step 5/5 "Самопроверка"
 [ "$(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null)" = 1 ] || die "Пересылка пакетов (ip_forward) не включилась."
 ok "пересылка пакетов включена"
-REACH=1
+REACH=1; first=1
 for m in "${MAP[@]}"; do
   up="${m#*:}"
   if timeout 8 bash -c "exec 3<>/dev/tcp/$UPSTREAM/$up" 2>/dev/null; then
     ok "зарубежный сервер $UPSTREAM:$up отвечает с моста"
-  else
+  elif [ "$first" = 1 ]; then
     REACH=0
     warn "зарубежный сервер $UPSTREAM:$up с моста НЕ отвечает."
     warn "Если VPN на нём ещё не установлен — это нормально. Иначе проверь IP и что сервер включён."
+  else
+    # остальные порты — запасные (gRPC, vpn grpc on): пока он выключен, сервер держит порт закрытым
+    say "порт $up сервера пока закрыт — это запасной порт, он заработает, если включить его на сервере"
   fi
+  first=0
 done
 say "Сквозная проверка — с зарубежного сервера (ключи есть только у него): vpn bridge test IP_МОСТА"
 

@@ -203,27 +203,34 @@ PY
 then MODE=upgrade; fi
 
 if [ "$MODE" = upgrade ]; then
+  # обычные входы (TCP) и запасной gRPC (vpn grpc on) — отдельно: gRPC сохраняется как есть
   mapfile -t E < <(python3 - "$CFG" <<'PY'
 import json, sys
 c = json.load(open(sys.argv[1]))
 v = [i for i in c["inbounds"] if i.get("protocol") == "vless"
      and i.get("streamSettings", {}).get("security") == "reality"]
-r = v[0]["streamSettings"]["realitySettings"]
+net = lambda i: i["streamSettings"].get("network") or "tcp"
+t = [i for i in v if net(i) != "grpc"] or v
+g = [i for i in v if net(i) == "grpc"]
+r = t[0]["streamSettings"]["realitySettings"]
 print(r["privateKey"])
 print(json.dumps(r.get("shortIds") or []))
 print((r.get("serverNames") or [""])[0])
 print(json.dumps(r.get("serverNames") or []))
-print(" ".join(str(i["port"]) for i in v))
+print(" ".join(str(i["port"]) for i in t if net(i) != "grpc"))
+print(f'{g[0]["port"]} {g[0]["streamSettings"].get("grpcSettings", {}).get("serviceName", "")}' if g else "")
 PY
 )
   PRIV="${E[0]}"; SIDS_JSON="${E[1]}"; OLD_DEST="${E[2]}"; OLD_NAMES_JSON="${E[3]}"; PORTS_USE="${E[4]}"
+  GRPC_KEEP="${E[5]:-}"; GRPC_PORT="${GRPC_KEEP%% *}"
+  [ -n "$PORTS_USE" ] || PORTS_USE="$NEW_PORTS"
   [ "$SIDS_JSON" != "[]" ] || SIDS_JSON="[\"$(openssl rand -hex 8)\"]"
   ok "VPN уже установлен — сохраняю ключи и выданные доступы (новые ключи: RESET=1)"
 else
   kp=$(xray x25519)
   PRIV=$(awk -F': *' '/^Private/{print $2; exit}' <<<"$kp")
   SIDS_JSON="[\"$(openssl rand -hex 8)\"]"
-  OLD_DEST=""; OLD_NAMES_JSON="[]"; PORTS_USE="$NEW_PORTS"
+  OLD_DEST=""; OLD_NAMES_JSON="[]"; PORTS_USE="$NEW_PORTS"; GRPC_KEEP=""; GRPC_PORT=""
   ok "созданы новые ключи шифрования"
 fi
 PUB=$(xray x25519 -i "$PRIV" | awk -F': *' '/^(Password|Public)/ && !f {print $2; f=1}')
@@ -256,9 +263,9 @@ step 6/8 "Настройка Xray"
 [ -f "$CFG" ] && cp "$CFG" "$OUT/config-before-setup-$(date +%Y%m%d-%H%M%S).json"
 mkdir -p "$LOGDIR"
 NEW_UUID=$(xray uuid)
-python3 - "$CFG" "$MODE" "$PRIV" "$SIDS_JSON" "$DEST" "$PORTS_USE" "$PC_KEY" "$NEW_UUID" "$LOGDIR" "$OLD_DEST" "$OLD_NAMES_JSON" <<'PY'
+python3 - "$CFG" "$MODE" "$PRIV" "$SIDS_JSON" "$DEST" "$PORTS_USE" "$PC_KEY" "$NEW_UUID" "$LOGDIR" "$OLD_DEST" "$OLD_NAMES_JSON" "$GRPC_KEEP" <<'PY'
 import json, sys, os
-cfg, mode, priv, sids_json, dest, ports, pc_key, new_uuid, logdir, old_dest, old_names_json = sys.argv[1:12]
+cfg, mode, priv, sids_json, dest, ports, pc_key, new_uuid, logdir, old_dest, old_names_json, grpc_keep = sys.argv[1:13]
 sids = json.loads(sids_json)
 names = json.loads(old_names_json) if dest == old_dest and old_names_json != "[]" else [dest]
 if dest not in names: names.insert(0, dest)
@@ -291,13 +298,22 @@ def inbound(port):
         "sniffing": {"enabled": True, "destOverride": ["http", "tls", "quic"], "routeOnly": True},
     }
 
+def grpc_inbound(port, service):  # запасной вход (vpn grpc on): те же ключи и клиенты, без Vision
+    i = inbound(port)
+    i["tag"] = f"vless-grpc-{port}"
+    i["settings"]["clients"] = [dict(u, flow="") for u in clients]
+    i["streamSettings"]["network"] = "grpc"
+    i["streamSettings"]["grpcSettings"] = {"serviceName": service}
+    return i
+
 private = ["0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8", "169.254.0.0/16",
            "172.16.0.0/12", "192.168.0.0/16", "::1/128", "fc00::/7", "fe80::/10"]
 c = {
     "log": {"loglevel": "warning", "access": f"{logdir}/access.log", "error": f"{logdir}/error.log"},
     # DNS-запросы устройств сервер обрабатывает сам (vpn dns on/off)
     "dns": {"servers": ["localhost", "https+local://1.1.1.1/dns-query"], "queryStrategy": "UseIPv4"},
-    "inbounds": [inbound(int(p)) for p in ports.split()],
+    "inbounds": [inbound(int(p)) for p in ports.split()]
+                + ([grpc_inbound(int(grpc_keep.split()[0]), grpc_keep.split()[1])] if len(grpc_keep.split()) == 2 else []),
     "outbounds": [{"tag": "direct", "protocol": "freedom"},
                   {"tag": "block", "protocol": "blackhole"},
                   {"tag": "dns-out", "protocol": "dns"}],
@@ -346,9 +362,9 @@ ok "BBR включён, журналы хранятся 3 дня"
 # ============================================================================
 step 7/8 "Защита сервера"
 if command -v ufw >/dev/null; then
-  for p in $SSH_PORTS $PORTS_USE; do ufw allow "$p"/tcp >/dev/null; done
+  for p in $SSH_PORTS $PORTS_USE $GRPC_PORT; do ufw allow "$p"/tcp >/dev/null; done
   ufw --force enable >/dev/null
-  ok "firewall включён: разрешены SSH ($SSH_PORTS) и VPN ($PORTS_USE)"
+  ok "firewall включён: разрешены SSH ($SSH_PORTS) и VPN ($PORTS_USE${GRPC_PORT:+, запасной gRPC $GRPC_PORT})"
 else
   warn "ufw не найден — firewall не настроен"
 fi
@@ -429,6 +445,18 @@ while read -r b bp; do
   fi
 done < <(vpn bridge list --plain 2>/dev/null || true)
 
+# запасной транспорт gRPC (если включён командой vpn grpc on): напрямую и через мосты
+GR_INFO=""
+if [ -n "$GRPC_PORT" ]; then
+  if vpn grpc test >/dev/null 2>&1; then ok "запрос через запасной gRPC (порт $GRPC_PORT) прошёл"; GR_INFO="$GRPC_PORT:1"
+  else warn "запрос через запасной gRPC (порт $GRPC_PORT) НЕ прошёл. Обычное подключение работает; проверь: vpn grpc"; GR_INFO="$GRPC_PORT:0"; fi
+  while read -r b bp; do
+    [ -n "$b" ] || continue
+    if vpn grpc test "$b" >/dev/null 2>&1; then ok "gRPC через мост $b прошёл"; GR_INFO+=",$b:1"
+    else warn "gRPC через мост $b НЕ прошёл: мост не пересылает порт $GRPC_PORT"; GR_INFO+=",$b:0"; fi
+  done < <(vpn bridge list --plain 2>/dev/null || true)
+fi
+
 vpn yaml "$PC_KEY" >/dev/null
 [ -s "$OUT/$PC_KEY.yaml" ] || die "Не удалось собрать профиль для компьютера."
 
@@ -441,7 +469,7 @@ if [ -n "$DEST_CHANGED" ]; then
 fi
 
 # ---- служебный вывод для install.ps1 ----
-echo "===VPN-INFO ip=$IP ports=${PORTS_USE// /,} dest=$DEST mode=$MODE dest_changed=${DEST_CHANGED:-0} bridges=${BR_INFO%,} version=$(vpn version 2>/dev/null || true)==="
+echo "===VPN-INFO ip=$IP ports=${PORTS_USE// /,} dest=$DEST mode=$MODE dest_changed=${DEST_CHANGED:-0} bridges=${BR_INFO%,} grpc=$GR_INFO version=$(vpn version 2>/dev/null || true)==="
 echo "===VPN-FILE vpn-$PC_KEY.yaml==="
 base64 -w 76 "$OUT/$PC_KEY.yaml"
 echo "===VPN-END==="
